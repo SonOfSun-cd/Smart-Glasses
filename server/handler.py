@@ -19,9 +19,13 @@ count = 0
 #uvicorn handler:app --reload
 
 def AI_analyse(id, image):
+    global count
     #global queue, model
     print("Got image")
-    frame = model.predict(Image.open(io.BytesIO(image)), conf=0.5)
+    img = Image.open(io.BytesIO(image))
+    # img.save(f"images/image_{count}.png")
+    # count+=1
+    frame = model.predict(img, conf=0.5)
     objects = []
     cords = []
     result = frame[0]

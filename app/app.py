@@ -2,7 +2,7 @@ from kivy.config import Config
 
 Config.set('graphics', 'width', '360')
 Config.set('graphics', 'height', '620')
-Config.set('graphics', 'resizable', False)
+# Config.set('graphics', 'resizable', False)
 
 from kivy.app import App
 from kivy.uix.label import Label
@@ -50,8 +50,22 @@ class main_app(App):
         return
     
     def AI_analyse(self, answer):
-        filters = ["car", "person", "bird", "handbag", "suitcase", "umbrella"]
-        distance_filter = {"person": [300, 700], "handbag": [80, 170], "car": [500, 700], "bird": [50,50], "suitcase": [150, 250]}
+        filters = ["car", "person", "dog", "cat", "bird", "handbag", "suitcase", "umbrella", "tv", "laptop", "microwave", "oven"]
+        distance_filter = {
+            "person": [300, 700], 
+            "handbag": [80, 170], 
+            "car": [500, 700], 
+            "bird": [50,50], 
+            "dog": [150, 250], 
+            "cat": [150, 250], 
+            "umbrella": [150, 250],
+            "tv": [150, 250], 
+            "laptop": [150, 250],
+            "oven": [150, 250],
+            "tv": [150, 250],
+            "microwave": [150, 250],
+            "suitcase": [150, 250],
+            }
         
         max_width = 1920 #Какая максимальная ширина изображения в пикселях
         max_dist = 500 #В пикселях относительно исходного изображения
@@ -199,7 +213,7 @@ class main_app(App):
         cursor = connection.cursor()
         cursor.execute("SELECT ESP_IP FROM AP_DATA WHERE rowid = 1")
         a = cursor.fetchall()
-        IP = "192.168.137.132" #a[0][0]
+        IP = "192.168.137.119" #a[0][0]
         connection.close()
         i=0
         session = requests.Session()
@@ -228,6 +242,8 @@ class main_app(App):
             # print(answer.json())
             # i+=1
             #print(answer.json())
+
+            
             if img.status_code == 200:
                 files = {"img": img.content}
                 answer = session.post(f"http://127.0.0.1:8000/session/{self.id}", files=files)
@@ -318,6 +334,8 @@ class main_app(App):
         button_layout.add_widget(Label(text=self.login if self.login!="" else "Вы не вошли в аккаунт", font_size="12sp"))
         button_layout.add_widget(self.Register_button)
         self.layout.add_widget(button_layout)
+
+        
         #---
 
         self.layout.add_widget(Label(text="Данные вашей точки доступа", font_size="24sp" ))
@@ -362,15 +380,17 @@ class main_app(App):
         button_layout.add_widget(register_cancel)
         self.login_layout.add_widget(button_layout)
 
-        self.login_layout_label = Label(text="Регистрация аккаунта", font_size="20sp")
+        self.login_layout_label = Label(text="Регистрация аккаунта/Вход в аккаунт", font_size="20sp")
         self.login_layout.add_widget(self.login_layout_label)
         self.login_input = TextInput(text=self.login if self.login!="" else "Введите логин", halign="center", size_hint_y = None, font_size="20sp")
         self.login_layout.add_widget(self.login_input)
         self.password_input = TextInput(text=self.password if self.password!="" else "Введите пароль", halign="center", size_hint_y = None, font_size="20sp")
         self.login_layout.add_widget(self.password_input)
         submit = Button(text="Зарегистрироваться")
+        Register_button = Button(text="Войти")
         submit.bind(on_press=self.submit_register)
         self.login_layout.add_widget(submit)
+        self.login_layout.add_widget(Register_button)
         
 
     
