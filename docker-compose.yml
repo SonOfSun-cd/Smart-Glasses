@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: AI_server
+    ports:
+      - "8000:80"
+    environment:
+      - DB_PATH=/server/data/db1.db
+    volumes:
+      - ./server_data:/server/data
+    restart: unless-stopped

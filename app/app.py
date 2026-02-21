@@ -213,7 +213,7 @@ class main_app(App):
         cursor = connection.cursor()
         cursor.execute("SELECT ESP_IP FROM AP_DATA WHERE rowid = 1")
         a = cursor.fetchall()
-        IP = "192.168.137.119" #a[0][0]
+        IP = "192.168.137.66" #a[0][0]
         connection.close()
         i=0
         session = requests.Session()

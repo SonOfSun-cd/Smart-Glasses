@@ -1,19 +1,28 @@
-from fastapi import FastAPI, Form, UploadFile, File
-from fastapi.responses import FileResponse, RedirectResponse
-import sqlite3
-import hashlib
+from fastapi import FastAPI, UploadFile, File, Depends
+from sqlalchemy.orm import Session
 import random
-import threading
 from ultralytics import YOLO
 from PIL import Image
-import cv2
 import io
+
+from db import Base, engine, get_db
+import models
+
 app = FastAPI()
 
 model = YOLO("./yolov8n.pt")
 sessions = []
 queue = {}
 count = 0
+
+
+for i in range(30):
+    try:
+        Base.metadata.create_all(bind=engine)
+        break
+    except Exception as e:
+        print("An error occured while building DB:", str(e))
+ 
 
 #Запуск сервера
 #uvicorn handler:app --reload
@@ -23,8 +32,8 @@ def AI_analyse(id, image):
     #global queue, model
     print("Got image")
     img = Image.open(io.BytesIO(image))
-    # img.save(f"images/image_{count}.png")
-    # count+=1
+    img.save(f"images/image_{count}.png")
+    count+=1
     frame = model.predict(img, conf=0.5)
     objects = []
     cords = []
@@ -44,14 +53,20 @@ def AI_analyse(id, image):
     return
 
     
+def createId():
+    id = ''.join(random.choices(random.choices("AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz0123456789", k=35),k=52))
+    return id
 
 
 
 @app.post("/session/{id}")
-async def session_get_image(id: str, img: UploadFile = File()):
+async def session_get_image(
+    id: str,
+    img: UploadFile = File(),
+    db: Session = Depends(get_db)):
     #global count, queue
     if id not in sessions:
-        return {"error": "this account didnt start any streaming session"}
+        return {"error": "Данный аккаунт не начинал сессию передачи данных"}
     content = await img.read()
     # r = threading.Thread(target=AI_analyse, args=(id, content))
     # r.start()
@@ -74,47 +89,40 @@ async def query_sessions():
     return {"sessions": sessions, "queue": queue}
 
 @app.get("/start/{login}/{password}")
-async def start_session(login: str, password: str):
+async def start_session(
+    login: str,
+    password: str,
+    db: Session = Depends(get_db)):
 
     #Позже хэширование будет происходить на стороне клиента
     # login = hashlib.sha256(login.encode()).hexdigest()
     # password = hashlib.sha256(password.encode()).hexdigest()
-
-    connection = sqlite3.connect("handler_db.db")
-    cursor = connection.cursor()
-    cursor.execute("SELECT * FROM USER_DATA WHERE login = ? AND password = ?", (login, password))
-    a = cursor.fetchall()
+    a = db.query(models.User).filter(models.User.login == login, models.User.password == password).first()
+    id = createId()
     print(a)
     if a==[]:
-        return {"error": "this account doesnt exist"}
-    elif a[0][2] in sessions:
-        return {"error": "this account already started streaming session"}
-    print(a[0][2])
-    sessions.append(a[0][2])
+        return {"error": "Данный аккаунт не существует"}
+    sessions.append(id)
     print(sessions)
-    connection.close()
+    return {"id": id}
 
 @app.get("/register/{login}/{password}")
-async def register(login: str, password: str):
-    connection = sqlite3.connect("handler_db.db")
-    cursor = connection.cursor()
-
+async def register(
+    login: str,
+    password: str,
+    db: Session = Depends(get_db)):
     # #Позже хэширование будет происходить на стороне клиента
     # login = hashlib.sha256(login.encode()).hexdigest()
     # password = hashlib.sha256(password.encode()).hexdigest()
 
-    cursor.execute("SELECT * FROM USER_DATA WHERE login = ?", (login,))
-    a = cursor.fetchall()
+    a = db.query(models.User).filter(models.User.login == login).first()
     print(a)
-    if a!=[]:
-        return {"error": "this account already exists"}
+    if a:
+        return {"error": "Данный логин уже занят"}
     
-    
-    id = ''.join(random.choices(random.choices("AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz0123456789", k=35),k=52))
-    cursor.execute("INSERT INTO USER_DATA (login, password, id) VALUES (?,?,?)",(login, password, id))
-    connection.commit()
-    connection.close()
-    return {"id": id}
+    db.add(models.User(login=login, password=password))
+    db.commit()
+    return
 
 
 @app.get("/")
