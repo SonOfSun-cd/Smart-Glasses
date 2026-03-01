@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Depends
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
 from sqlalchemy.orm import Session
 import random
 from ultralytics import YOLO
@@ -66,7 +66,8 @@ async def session_get_image(
     db: Session = Depends(get_db)):
     #global count, queue
     if id not in sessions:
-        return {"error": "Данный аккаунт не начинал сессию передачи данных"}
+        raise HTTPException(status_code=400, detail="Данный аккаунт не начинал сессию передачи данных")
+    
     content = await img.read()
     # r = threading.Thread(target=AI_analyse, args=(id, content))
     # r.start()
@@ -100,8 +101,8 @@ async def start_session(
     a = db.query(models.User).filter(models.User.login == login, models.User.password == password).first()
     id = createId()
     print(a)
-    if a==[]:
-        return {"error": "Данный аккаунт не существует"}
+    if a is None:
+        raise HTTPException(status_code=400, detail="Данный аккаунт не существует")
     sessions.append(id)
     print(sessions)
     return {"id": id}
@@ -118,7 +119,7 @@ async def register(
     a = db.query(models.User).filter(models.User.login == login).first()
     print(a)
     if a:
-        return {"error": "Данный логин уже занят"}
+        raise HTTPException(status_code=400, detail="Данный логин уже занят")
     
     db.add(models.User(login=login, password=password))
     db.commit()

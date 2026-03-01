@@ -1,18 +1,29 @@
 from ultralytics import YOLO
 import cv2
+import requests
 import time
+from PIL import Image
+import io
 
 model = YOLO("./yolov8n.pt")
+
+
+ip = "192.168.137.26"
+session = requests.Session()
+session.headers.update({"Connection": "keep-alive"})
+
 for i in range(1000000):
     try:
-        f = open(f"./images/img_{i}.jpg", "r")
-        f.close()
-    except:
-        continue
-
+        img = session.get(f"http://{ip}:3000/img").content
     
+    except:
+        print("Not able to establish connection. Retrying...")
+        continue
+    
+    img = Image.open(io.BytesIO(img))
+    print(i)
 
-    frame = model.predict(f"./images/img_{i}.jpg", conf=0.5)
+    frame = model.predict(img)
     img = frame[0].plot()
     cv2.imshow('object detection', img)
     objects = []
@@ -33,6 +44,6 @@ for i in range(1000000):
     #time.sleep(2)
     print(objects)
     print(cords)
-    key = cv2.waitKey(1000) & 0xFF
+    key = cv2.waitKey(1) & 0xFF
 cv2.destroyAllWindows()
 

@@ -1,7 +1,13 @@
 {
-    "ip": "...",
-    "esp_ip": "...",
-    "SSID": "",
-    "PASSWORD": "",
-    "EXCHANGED": false
+    "AP_DATA": {
+        "ip": "10.243.62.9",
+        "SSID": "phone",
+        "PASSWORD": "12345pswrd",
+        "EXCHANGED": true,
+        "MAC": ""
+    },
+    "USER_DATA": {
+        "login": "Tony",
+        "password": "Mypassword"
+    }
 }

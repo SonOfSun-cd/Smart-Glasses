@@ -1,4 +1,5 @@
 from kivy.config import Config
+from numpy import rint
 
 Config.set('graphics', 'width', '360')
 Config.set('graphics', 'height', '620')
@@ -10,38 +11,54 @@ from kivy.uix.button import Button
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.textinput import TextInput
 
-import subprocess
 import time
 import requests
+from requests.exceptions import HTTPError
 import threading
 import socket
-import sqlite3
 import json
 import hashlib
 
 
 class main_app(App):
+    def load_db(self):
+        with open("./db.json", "r") as f:
+            return json.load(f)
+    
+    def save_db(self, data):
+        with open("./db.json", "w") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+    
     def AP_data_send(self):
         #"start", "cmd", "/k", 
         #os.chdir("C:/Users/user/Desktop/cam/flask_servers")
         #winwifi.WinWiFi.connect("ESP32_","pfur0651")
-        connection = sqlite3.connect("./db.db", check_same_thread=False)
-        cursor = connection.cursor()
-        cursor.execute("UPDATE AP_DATA SET SSID = ?, PASSWORD = ? WHERE rowid = 1", (self.SSID_Input.text, self.PSWRD_Input.text))
-        connection.commit()
-        cursor.close()
+        db = self.load_db()
+        db["AP_DATA"]["SSID"] = self.SSID_Input.text
+        db["AP_DATA"]["PASSWORD"] = self.PSWRD_Input.text
+        self.save_db(db)
 
-        result = subprocess.Popen(["py","data_exchange.py"], shell=True)
+        #result = subprocess.Popen(["py","data_exchange.py"], shell=True)
         self.label.text = "Процесс передачи начат"
-        print(self.check)
-        time.sleep(10)
-        while True:
+        try:
+            ap_data_request = requests.post("http://192.168.4.1:3000/ap_data", json={"ssid": self.SSID_Input.text, "password": self.PSWRD_Input.text, "ip": "192.168.4.1"})
+            ap_data_request.raise_for_status()
+
+            print(ap_data_request.text)
+
+            time.sleep(5)
             try:
-                requests.post("http://127.0.0.1:3000/end")
-                time.sleep(5)
-            except:
-                break
-        print("Shutting down the server")
+                mac_adress = requests.get("http://192.168.4.1:3000/mac")
+                mac_adress.raise_for_status()
+
+                self.mac = mac_adress.text
+                print(self.mac)
+            except HTTPError as e:
+                self.label.text = f"Ошибка при получении MAC адреса: {e}"
+                return
+        except HTTPError as e:
+            self.label.text = f"Ошибка при передаче данных: {e}"
+            return
         if self.is_getting_AP_data:
             self.label.text = "Процесс передачи завершен"
             self.is_getting_AP_data = False
@@ -209,14 +226,10 @@ class main_app(App):
         pass           
 
     def Server_start(self):
-        connection = sqlite3.connect("./db.db", check_same_thread=False)
-        cursor = connection.cursor()
-        cursor.execute("SELECT ESP_IP FROM AP_DATA WHERE rowid = 1")
-        a = cursor.fetchall()
-        IP = "192.168.137.66" #a[0][0]
-        connection.close()
+        IP = "192.168.137.85"
         i=0
         session = requests.Session()
+        session.headers.update({"Connection": "keep-alive"})
 
         #Начало сессии с головным сервером
 
@@ -224,36 +237,38 @@ class main_app(App):
         password = hashlib.sha256(self.password.encode()).hexdigest()
         try:
             session_start = requests.get(f"http://127.0.0.1:8000/start/{login}/{password}")
-            print(session_start.json())
-            if session_start.status_code == 200:
-                print("Succesfully started session")
-        except:
-            print("Not able to start session. May be problem with head server")
-            return
+            session_start.raise_for_status()
 
+            print(session_start.json())
+            self.id = session_start.json()["id"]
+        except HTTPError as error:
+            self.label.text = f"Ошибка при установлении соединения: {error.response.text}"
+            return
+            
         while self.started_server:
             try:
                 img = session.get(f"http://{IP}:3000/img")
+                if img.status_code == 200:
+                    files = {"img": img.content}
+                    try:
+                        answer = session.post(f"http://127.0.0.1:8000/session/{self.id}", files=files)
+                        answer.raise_for_status()
+
+                        if answer.json()["answer"]!="...":
+                            f = threading.Thread(target=self.AI_analyse, args=(answer.json()["answer"],))
+                            f.start()
+                    except HTTPError as error:
+                        self.label.text = f"Ошибка при отправке изображения: {error.response.text}"
+                        return
+                    i+=1
             except:
-                self.label.text = "Не получается установить соединение. Повторяю попытку..."
-                #continue
+                self.label.text = f"Не получается установить соединение. Повторяю попытку..."
+                continue
             # files = {"img": open(f"./images/img_{i}.jpg", "rb")}
             # answer = requests.post(f"http://127.0.0.1:8000/session/{self.id}", files=files)
             # print(answer.json())
             # i+=1
             #print(answer.json())
-
-            
-            if img.status_code == 200:
-                files = {"img": img.content}
-                answer = session.post(f"http://127.0.0.1:8000/session/{self.id}", files=files)
-                i+=1
-            else:
-                print("Невозможно установить соединение")
-            if answer.json()["answer"]!="...":
-                
-                f = threading.Thread(target=self.AI_analyse, args=(answer.json()["answer"],))
-                f.start()
         #server = subprocess.Popen(["py","server.py"], shell=True)
         #ai_analyse = subprocess.Popen(["py", "AI.py"], shell=True)
         self.label.text = "..."
@@ -287,33 +302,32 @@ class main_app(App):
 
         self.colors = {"green": (0,1,0,1), "red": (1,0,0,1), "grey": (1,1,1,1)}
 
-
-        connection = sqlite3.connect("./db.db", check_same_thread=False)
-        cursor = connection.cursor()
+        db = self.load_db()
         name = socket.gethostname()
         IP = "10.243.62.9"
         print(IP, name)
-        cursor.execute("UPDATE AP_DATA SET IP = ? WHERE rowid = ?", (IP, 1))
-        connection.commit()
-        cursor.execute("SELECT * FROM AP_DATA WHERE rowid = 1")
-        a = cursor.fetchall()
-        print(a)
-        self.sent_AP_data = True if a[0][3]!=None and a[0][3]!=0 else False
-        self.SSID = a[0][1]
-        self.PSWRD = a[0][2]
+        db["AP_DATA"]["ip"] = IP
+        self.save_db(db)
+        
+        ap_data = db["AP_DATA"]
+        print(ap_data)
+        self.sent_AP_data = True if ap_data.get("EXCHANGED") else False
+        self.SSID = ap_data.get("SSID", "")
+        self.PSWRD = ap_data.get("PASSWORD", "")
+        self.mac = ap_data.get("MAC", "")
         print(self.sent_AP_data)
         
-        cursor.execute("SELECT * FROM USER_DATA WHERE rowid = 1")
-        a = cursor.fetchall()
-        self.login = None
-        self.password = None
-        if a!=[]:
-            print(a)
-            self.login = a[0][0]
-            self.password = a[0][1]
-            self.id = a[0][2]
+        user_data = db["USER_DATA"]
+        self.login = user_data.get("login")
+        self.password = user_data.get("password")
+        self.id = user_data.get("id")
         
-        cursor.close()
+        if self.login:
+            print(user_data)
+        else:
+            self.login = None
+            self.password = None
+            self.id = None
 
     def build(self):
         self.main_layout = BoxLayout(orientation="vertical")
@@ -331,7 +345,7 @@ class main_app(App):
         button_layout.height = 75
         self.Register_button = Button(text="Зарегистрироваться", size=(10,10))
         self.Register_button.bind(on_press=self.register)
-        button_layout.add_widget(Label(text=self.login if self.login!="" else "Вы не вошли в аккаунт", font_size="12sp"))
+        button_layout.add_widget(Label(text=self.login if self.login!=None else "Вы не вошли в аккаунт", font_size="12sp"))
         button_layout.add_widget(self.Register_button)
         self.layout.add_widget(button_layout)
 
@@ -382,9 +396,9 @@ class main_app(App):
 
         self.login_layout_label = Label(text="Регистрация аккаунта/Вход в аккаунт", font_size="20sp")
         self.login_layout.add_widget(self.login_layout_label)
-        self.login_input = TextInput(text=self.login if self.login!="" else "Введите логин", halign="center", size_hint_y = None, font_size="20sp")
+        self.login_input = TextInput(text=self.login if self.login!=None else "Введите логин", halign="center", size_hint_y = None, font_size="20sp")
         self.login_layout.add_widget(self.login_input)
-        self.password_input = TextInput(text=self.password if self.password!="" else "Введите пароль", halign="center", size_hint_y = None, font_size="20sp")
+        self.password_input = TextInput(text=self.password if self.password!=None else "Введите пароль", halign="center", size_hint_y = None, font_size="20sp")
         self.login_layout.add_widget(self.password_input)
         submit = Button(text="Зарегистрироваться")
         Register_button = Button(text="Войти")
@@ -395,13 +409,14 @@ class main_app(App):
 
     
     def on_stop(self):
-        connection = sqlite3.connect("./db.db", check_same_thread=False)
-        cursor = connection.cursor()
-        cursor.execute("UPDATE AP_DATA SET SSID = ?, PASSWORD = ? , EXCHANGED = ? WHERE rowid = 1", (self.SSID_Input.text, self.PSWRD_Input.text, int(self.sent_AP_data),))
-        connection.commit()
-        cursor.execute("UPDATE USER_DATA SET login = ?, password = ?, id = ? WHERE rowid = 1", (self.login, self.password, self.id))
-        connection.commit()
-        cursor.close()
+        db = self.load_db()
+        db["AP_DATA"]["SSID"] = self.SSID_Input.text
+        db["AP_DATA"]["PASSWORD"] = self.PSWRD_Input.text
+        db["AP_DATA"]["EXCHANGED"] = bool(self.sent_AP_data)
+        db["AP_DATA"]["MAC"] = self.mac
+        db["USER_DATA"]["login"] = self.login
+        db["USER_DATA"]["password"] = self.password
+        self.save_db(db)
         print("Commiting all changes")
 
     #Функции для кнопок
