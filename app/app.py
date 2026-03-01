@@ -18,6 +18,7 @@ import threading
 import socket
 import json
 import hashlib
+import pyttsx3
 
 
 class main_app(App):
@@ -218,12 +219,32 @@ class main_app(App):
         self.queue.append(text)
         print(text)
         print(self.queue)
-        self.queue.clear()
 
         return
     
     def Voice_text(self):
-        pass           
+        while True:
+            if self.queue:
+                text = ""
+                rate = 230
+                if any("!" in text for text in self.queue):
+                    text = [text for text in self.queue if "!" in text][0]
+                    self.queue.remove(text)
+                    rate=300
+                else:
+                    text = self.queue[0]
+                    self.queue = self.queue[1:]
+                    print(text)
+                self.say = threading.Thread(target=self.Voice_process, args=(text, rate))
+                self.say.start()
+
+
+    def Voice_process(self, text, rate):
+        engine = pyttsx3.init()
+        engine.setProperty('rate', rate)
+        engine.say(text)
+        engine.runAndWait()
+
 
     def Server_start(self):
         IP = "192.168.137.85"
