@@ -19,7 +19,33 @@ import threading
 import socket
 import json
 import hashlib
-import pyttsx3
+
+if platform == "android":
+    from jnius import autoclass, PythonJavaClass, java_method
+
+
+    class AndroidTTSInitListener(PythonJavaClass):
+        __javainterfaces__ = ["android/speech/tts/TextToSpeech$OnInitListener"]
+        __javacontext__ = "app"
+
+        def __init__(self, app):
+            super().__init__()
+            self.app = app
+
+        @java_method("(I)V")
+        def onInit(self, status):
+            self.app.tts_ready = status == self.app.android_tts_class.SUCCESS
+            if not self.app.tts_ready:
+                self.app._set_status("Android TTS не инициализировался")
+                return
+
+            if self.app.tts_locale is not None:
+                self.app.tts_engine.setLanguage(self.app.tts_locale)
+
+            if self.app.pending_tts is not None:
+                text, rate, reason = self.app.pending_tts
+                self.app.pending_tts = None
+                self.app._speak_text(text, rate, reason)
 
 
 class main_app(App):
@@ -62,6 +88,67 @@ class main_app(App):
     def _set_status(self, text):
         if hasattr(self, "label") and self.label is not None:
             self.label.text = str(text)
+
+    def _init_voice_backend(self):
+        if self.voice_backend_ready:
+            return
+
+        if platform != "android":
+            self.voice_backend = "console"
+            self.voice_backend_ready = True
+            return
+
+        try:
+            self.android_tts_class = autoclass("android.speech.tts.TextToSpeech")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            Locale = autoclass("java.util.Locale")
+
+            self.tts_locale = Locale("ru", "RU")
+            self.tts_listener = AndroidTTSInitListener(self)
+            self.tts_engine = self.android_tts_class(PythonActivity.mActivity, self.tts_listener)
+            self.voice_backend = "android_tts"
+            self.voice_backend_ready = True
+            self._set_status("Инициализирую Android TTS...")
+        except Exception as error:
+            self.voice_backend = "console"
+            self.voice_backend_ready = True
+            self._set_status(f"TTS fallback в консоль: {error}")
+
+    def _voice_is_busy(self):
+        if self.voice_backend == "android_tts" and self.tts_engine is not None and self.tts_ready:
+            return bool(self.tts_engine.isSpeaking())
+        return time.time() < self.console_voice_busy_until
+
+    def _stop_voice_output(self, reason):
+        if self.voice_backend == "android_tts" and self.tts_engine is not None and self.tts_ready:
+            self.tts_engine.stop()
+            return
+
+        if self.console_voice_busy_until > time.time():
+            print(f"[VOICE/interrupt/{reason}] текущая речь остановлена")
+        self.console_voice_busy_until = 0
+
+    def _speak_text(self, text, rate, reason):
+        self._init_voice_backend()
+
+        if self.voice_backend == "android_tts":
+            if not self.tts_ready:
+                self.pending_tts = (text, rate, reason)
+                return False
+
+            speech_rate = 1.2 if rate >= 300 else 1.0
+            self.tts_engine.setSpeechRate(speech_rate)
+
+            try:
+                utterance_id = str(int(time.time() * 1000))
+                self.tts_engine.speak(text, self.android_tts_class.QUEUE_FLUSH, None, utterance_id)
+            except TypeError:
+                self.tts_engine.speak(text, self.android_tts_class.QUEUE_FLUSH, None)
+            return True
+
+        print(f"[VOICE/{reason}] rate={rate} text={text}")
+        self.console_voice_busy_until = time.time() + min(max(len(text) / 35, 1.0), 4.0)
+        return True
 
     def _read_android_arp_table(self):
         try:
@@ -469,30 +556,18 @@ class main_app(App):
     def Voice_text(self):
         while True:
             if self.queue:
-                text = ""
-                rate = 230
                 dangers = [text for text in self.queue if "!" in text]
                 if dangers:
-                    text = dangers[0]
+                    text = dangers[-1]
                     self.queue.remove(text)
-                    rate=300
-                    if self.say is not None and self.say.is_alive():
-                        self.say.daemon = True
-                else:
-                    text = self.queue[0]
+                    if self._voice_is_busy():
+                        self._stop_voice_output("warning")
+                    self._speak_text(text, 300, "warning")
+                elif not self._voice_is_busy():
+                    text = self.queue[-1]
                     self.queue = self.queue[1:]
-                    print(text)
-                if self.say is None or not self.say.is_alive():
-                    self.say = threading.Thread(target=self.Voice_process, args=(text, rate), daemon=True)
-                    self.say.start()
+                    self._speak_text(text, 230, "scene")
             time.sleep(0.05)
-
-
-    def Voice_process(self, text, rate):
-        engine = pyttsx3.init()
-        engine.setProperty('rate', rate)
-        engine.say(text)
-        engine.runAndWait()
 
 
     def Server_start(self):
@@ -519,8 +594,9 @@ class main_app(App):
         except HTTPError as error:
             self.label.text = f"Ошибка при установлении соединения: {error.response.text}"
             return
-        f = threading.Thread(target=self.Voice_text)
-        f.start()
+        if self.voice_thread is None or not self.voice_thread.is_alive():
+            self.voice_thread = threading.Thread(target=self.Voice_text, daemon=True)
+            self.voice_thread.start()
         while self.started_server:
             try:
                 img = session.get(f"http://{IP}:3000/img")
@@ -588,8 +664,17 @@ class main_app(App):
         # Очередь озвучки и её максимальный размер.
         self.queue = []
         self.max_queue_len = 15
-        # Текущий процесс озвучки.
-        self.say = None
+        # Backend озвучки: Android TTS в проде и консольная симуляция на ПК.
+        self.voice_thread = None
+        self.voice_backend = None
+        self.voice_backend_ready = False
+        self.tts_engine = None
+        self.tts_listener = None
+        self.tts_ready = False
+        self.tts_locale = None
+        self.android_tts_class = None
+        self.pending_tts = None
+        self.console_voice_busy_until = 0
         # Последняя озвученная сигнатура сцены для отсечения одинаковых описаний.
         self.last_scene_signature = None
         self.last_important_count = 0
@@ -713,6 +798,13 @@ class main_app(App):
 
     
     def on_stop(self):
+        if self.voice_backend == "android_tts" and self.tts_engine is not None:
+            try:
+                self.tts_engine.stop()
+                self.tts_engine.shutdown()
+            except Exception:
+                pass
+
         db = self.load_db()
         db["AP_DATA"]["SSID"] = self.SSID_Input.text
         db["AP_DATA"]["PASSWORD"] = self.PSWRD_Input.text
