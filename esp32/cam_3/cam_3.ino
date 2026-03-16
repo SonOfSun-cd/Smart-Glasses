@@ -1,4 +1,4 @@
-#include <WiFi.h>
+﻿#include <WiFi.h>
 #include <HTTPClient.h>
 #include <esp_camera.h>
 #include <esp_wifi.h>
@@ -6,6 +6,7 @@
 #include <SD_MMC.h>
 #include <FS.h>
 #include <ArduinoJson.h>
+#include <WiFiUdp.h>
 
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
@@ -27,16 +28,53 @@
 const char *AP_ssid = "ESP32_";
 const char *AP_password = "pfur0651";
 
-const char *ssid;
-const char *password;
-const char *ip;
+char ssid[64] = {};
+char password[64] = {};
+char ip[32] = {};
 char mac[18] = {}; 
+const uint16_t discoveryPort = 4210;
+unsigned long lastDiscoveryAnnounce = 0;
+WiFiUDP discoveryUdp;
 
 IPAddress local_ip(192,168,1,1);
 IPAddress gateway(192,168,1,1);
 IPAddress subnet(255,255,255,0);
 
 WebServer server(3000);
+
+void SendDiscoveryAnnounce(bool force = false)
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    return;
+  }
+
+  if (!force && millis() - lastDiscoveryAnnounce < 2000)
+  {
+    return;
+  }
+
+  String payload = "SMART_GLASSES|ESP32|" + String(mac) + "|" + WiFi.localIP().toString() + "|3000";
+  IPAddress gatewayIp = WiFi.gatewayIP();
+  IPAddress broadcastIp;
+  IPAddress localIp = WiFi.localIP();
+  IPAddress subnetMask = WiFi.subnetMask();
+
+  for (int i = 0; i < 4; i++)
+  {
+    broadcastIp[i] = localIp[i] | (~subnetMask[i]);
+  }
+
+  discoveryUdp.beginPacket(gatewayIp, discoveryPort);
+  discoveryUdp.print(payload);
+  discoveryUdp.endPacket();
+
+  discoveryUdp.beginPacket(broadcastIp, discoveryPort);
+  discoveryUdp.print(payload);
+  discoveryUdp.endPacket();
+
+  lastDiscoveryAnnounce = millis();
+}
 
 void camera_setup(){
   camera_config_t config;
@@ -97,7 +135,7 @@ void setup() {
     db_write["MAC"] = mac;
     serializeJson(db_write, db1);
     db1.close();
-    Serial.println("Прошло успешно");
+    Serial.println("РџСЂРѕС€Р»Рѕ СѓСЃРїРµС€РЅРѕ");
     ESP.restart();
   }
   strcpy(mac, mac_check);
@@ -106,14 +144,16 @@ void setup() {
   
   if (String(IP_check).length()==3)
   {
-    Serial.println("Запускаю процесс получения данных точки доступа");
-    StartAP(); //Первоначальная настройка с передачей и получением данных точки доступа
+    Serial.println("Р—Р°РїСѓСЃРєР°СЋ РїСЂРѕС†РµСЃСЃ РїРѕР»СѓС‡РµРЅРёСЏ РґР°РЅРЅС‹С… С‚РѕС‡РєРё РґРѕСЃС‚СѓРїР°");
+    StartAP(); //РџРµСЂРІРѕРЅР°С‡Р°Р»СЊРЅР°СЏ РЅР°СЃС‚СЂРѕР№РєР° СЃ РїРµСЂРµРґР°С‡РµР№ Рё РїРѕР»СѓС‡РµРЅРёРµРј РґР°РЅРЅС‹С… С‚РѕС‡РєРё РґРѕСЃС‚СѓРїР°
   }
   else 
   {
-    ip = data["IP"];
-    StartConnection(data["ssid"], data["password"]); //Начало соединения
-    CheckConnection(); //Проверка соединения
+    snprintf(ip, sizeof(ip), "%s", data["IP"] | "");
+    snprintf(ssid, sizeof(ssid), "%s", data["ssid"] | "");
+    snprintf(password, sizeof(password), "%s", data["password"] | "");
+    StartConnection(ssid, password); //РќР°С‡Р°Р»Рѕ СЃРѕРµРґРёРЅРµРЅРёСЏ
+    CheckConnection(); //РџСЂРѕРІРµСЂРєР° СЃРѕРµРґРёРЅРµРЅРёСЏ
   }
   camera_setup();
   server.on("/img", handle_imgPOST);
@@ -132,7 +172,7 @@ void StartConnection(const char* SSID, const char* PASSWORD)
   {
     if (count>=20)
     {
-      Serial.println("Невозможно установить подключение. Введите другие данные или попробуйте снова");
+      Serial.println("РќРµРІРѕР·РјРѕР¶РЅРѕ СѓСЃС‚Р°РЅРѕРІРёС‚СЊ РїРѕРґРєР»СЋС‡РµРЅРёРµ. Р’РІРµРґРёС‚Рµ РґСЂСѓРіРёРµ РґР°РЅРЅС‹Рµ РёР»Рё РїРѕРїСЂРѕР±СѓР№С‚Рµ СЃРЅРѕРІР°");
       break;
     }
     delay(500);
@@ -142,6 +182,8 @@ void StartConnection(const char* SSID, const char* PASSWORD)
   Serial.println(WiFi.status());
   Serial.println(WiFi.localIP());
   Serial.println(String(WiFi.localIP()));
+  discoveryUdp.begin(discoveryPort);
+  SendDiscoveryAnnounce(true);
 }
 
 void CheckConnection()
@@ -192,9 +234,9 @@ void handleAPDataExchange()
   Serial.println("Fetched");
   JsonDocument json;
   deserializeJson(json, doc);
-  ssid = json["ssid"];
-  password = json["password"];
-  ip = json["ip"];
+  snprintf(ssid, sizeof(ssid), "%s", json["ssid"] | "");
+  snprintf(password, sizeof(password), "%s", json["password"] | "");
+  snprintf(ip, sizeof(ip), "%s", json["ip"] | "");
   const char* abs =json[0]["ssid"];
   const char* sba =json[0]["password"];
 
@@ -217,7 +259,7 @@ void sendMACaddress()
   server.stop();
 
   StartConnection(ssid, password);
-  CheckConnection(); //Проверка соединения
+  CheckConnection(); //РџСЂРѕРІРµСЂРєР° СЃРѕРµРґРёРЅРµРЅРёСЏ
 
   server.begin();
 }
@@ -260,9 +302,9 @@ void GetAPdata(char *IP)
     Serial.println("Fetched");
     JsonDocument json;
     deserializeJson(json, doc);
-    ssid = json[0]["ssid"];
-    password = json[0]["password"];
-    ip = json[0]["IP"];
+    snprintf(ssid, sizeof(ssid), "%s", json[0]["ssid"] | "");
+    snprintf(password, sizeof(password), "%s", json[0]["password"] | "");
+    snprintf(ip, sizeof(ip), "%s", json[0]["IP"] | "");
     const char* abs =json[0]["ssid"];
     const char* sba =json[0]["password"];
 
@@ -306,4 +348,7 @@ String IpAddress2String(const IPAddress& ipAddress)
 void loop() {
   //put your main code here, to run repeatedly:
   server.handleClient();
+  SendDiscoveryAnnounce();
 }
+
+

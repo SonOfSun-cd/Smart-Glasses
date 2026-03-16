@@ -1,5 +1,4 @@
-from kivy.config import Config
-from numpy import rint
+﻿from kivy.config import Config
 
 Config.set('graphics', 'width', '360')
 Config.set('graphics', 'height', '620')
@@ -36,7 +35,7 @@ if platform == "android":
         def onInit(self, status):
             self.app.tts_ready = status == self.app.android_tts_class.SUCCESS
             if not self.app.tts_ready:
-                self.app._set_status("Android TTS не инициализировался")
+                self.app._set_status("Android TTS РЅРµ РёРЅРёС†РёР°Р»РёР·РёСЂРѕРІР°Р»СЃСЏ")
                 return
 
             if self.app.tts_locale is not None:
@@ -89,6 +88,63 @@ class main_app(App):
         if hasattr(self, "label") and self.label is not None:
             self.label.text = str(text)
 
+    def _start_discovery_listener(self):
+        if self.discovery_thread is not None and self.discovery_thread.is_alive():
+            return
+
+        self.discovery_running = True
+        self.discovery_thread = threading.Thread(target=self._listen_for_device_announces, daemon=True)
+        self.discovery_thread.start()
+
+    def _listen_for_device_announces(self):
+        try:
+            self.discovery_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.discovery_socket.bind(("0.0.0.0", self.discovery_port))
+            self.discovery_socket.settimeout(1.0)
+        except Exception as error:
+            self.discovery_socket = None
+            self._set_status(f"РќРµ РїРѕР»СѓС‡РёР»РѕСЃСЊ Р·Р°РїСѓСЃС‚РёС‚СЊ UDP discovery: {error}")
+            return
+
+        while self.discovery_running:
+            try:
+                payload, addr = self.discovery_socket.recvfrom(512)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            except Exception:
+                continue
+
+            try:
+                message = payload.decode("utf-8").strip()
+            except UnicodeDecodeError:
+                continue
+
+            parts = message.split("|")
+            if len(parts) != 5 or parts[0] != "SMART_GLASSES":
+                continue
+
+            _, device_name, device_mac, device_ip, device_port = parts
+            normalized_mac = self._normalize_mac(device_mac)
+            if not normalized_mac:
+                continue
+
+            self.discovered_hosts[normalized_mac] = {
+                "name": device_name,
+                "ip": device_ip.strip() or addr[0],
+                "port": device_port.strip(),
+                "last_seen": time.time(),
+            }
+
+        if self.discovery_socket is not None:
+            try:
+                self.discovery_socket.close()
+            except OSError:
+                pass
+            self.discovery_socket = None
+
     def _init_voice_backend(self):
         if self.voice_backend_ready:
             return
@@ -108,11 +164,11 @@ class main_app(App):
             self.tts_engine = self.android_tts_class(PythonActivity.mActivity, self.tts_listener)
             self.voice_backend = "android_tts"
             self.voice_backend_ready = True
-            self._set_status("Инициализирую Android TTS...")
+            self._set_status("РРЅРёС†РёР°Р»РёР·РёСЂСѓСЋ Android TTS...")
         except Exception as error:
             self.voice_backend = "console"
             self.voice_backend_ready = True
-            self._set_status(f"TTS fallback в консоль: {error}")
+            self._set_status(f"TTS fallback РІ РєРѕРЅСЃРѕР»СЊ: {error}")
 
     def _voice_is_busy(self):
         if self.voice_backend == "android_tts" and self.tts_engine is not None and self.tts_ready:
@@ -125,7 +181,7 @@ class main_app(App):
             return
 
         if self.console_voice_busy_until > time.time():
-            print(f"[VOICE/interrupt/{reason}] текущая речь остановлена")
+            print(f"[VOICE/interrupt/{reason}] С‚РµРєСѓС‰Р°СЏ СЂРµС‡СЊ РѕСЃС‚Р°РЅРѕРІР»РµРЅР°")
         self.console_voice_busy_until = 0
 
     def _speak_text(self, text, rate, reason):
@@ -176,31 +232,46 @@ class main_app(App):
 
             return []
         except Exception as error:
-            self._set_status(f"Ошибка чтения ARP: {error}")
+            self._set_status(f"РћС€РёР±РєР° С‡С‚РµРЅРёСЏ ARP: {error}")
             return []
 
-    def _resolve_esp32_ip(self, target_mac=None, default_ip=None, target_name="ESP32"):
+    def _resolve_esp32_ip(self, target_mac=None, default_ip=None, target_name="ESP32", wait_for_announce=True):
         if default_ip is None:
             default_ip = self.default_esp32_ip
-
-        if platform != "android":
-            return default_ip
 
         target_mac = self._normalize_mac(target_mac)
         if not target_mac:
             self._set_status(f"MAC {target_name} не задан, использую запасной IP")
             return default_ip
 
-        arp_lines = self._read_android_arp_table()
-        for line in arp_lines:
-            normalized_line = line.lower()
-            if target_mac in normalized_line:
-                parts = line.split()
-                if parts:
-                    self._set_status(f"{target_name} найден в ARP: {parts[0]}")
-                    return parts[0]
+        self._start_discovery_listener()
 
-        self._set_status(f"MAC {target_name} не найден в ARP, использую запасной IP")
+        known_host = self.discovered_hosts.get(target_mac)
+        if known_host is not None:
+            self._set_status(f"{target_name} найден через UDP discovery: {known_host['ip']}")
+            return known_host["ip"]
+
+        if wait_for_announce:
+            self._set_status(f"Жду UDP announce от {target_name}...")
+            deadline = time.time() + self.discovery_wait_seconds
+            while time.time() < deadline:
+                known_host = self.discovered_hosts.get(target_mac)
+                if known_host is not None:
+                    self._set_status(f"{target_name} найден через UDP discovery: {known_host['ip']}")
+                    return known_host["ip"]
+                time.sleep(0.2)
+
+        if platform == "android":
+            arp_lines = self._read_android_arp_table()
+            for line in arp_lines:
+                normalized_line = line.lower()
+                if target_mac in normalized_line:
+                    parts = line.split()
+                    if parts:
+                        self._set_status(f"{target_name} найден в ARP: {parts[0]}")
+                        return parts[0]
+
+        self._set_status(f"{target_name} не найден, использую запасной IP")
         return default_ip
 
     def _build_scene_signature(self, groups, obj, filters, positions):
@@ -350,7 +421,7 @@ class main_app(App):
         self.save_db(db)
 
         #result = subprocess.Popen(["py","data_exchange.py"], shell=True)
-        self.label.text = "Процесс передачи начат"
+        self.label.text = "РџСЂРѕС†РµСЃСЃ РїРµСЂРµРґР°С‡Рё РЅР°С‡Р°С‚"
         try:
             ap_data_request = requests.post("http://192.168.4.1:3000/ap_data", json={"ssid": self.SSID_Input.text, "password": self.PSWRD_Input.text, "ip": "192.168.4.1"})
             ap_data_request.raise_for_status()
@@ -365,13 +436,13 @@ class main_app(App):
                 self.mac = mac_adress.text
                 print(self.mac)
             except HTTPError as e:
-                self.label.text = f"Ошибка при получении MAC адреса: {e}"
+                self.label.text = f"РћС€РёР±РєР° РїСЂРё РїРѕР»СѓС‡РµРЅРёРё MAC Р°РґСЂРµСЃР°: {e}"
                 return
         except HTTPError as e:
-            self.label.text = f"Ошибка при передаче данных: {e}"
+            self.label.text = f"РћС€РёР±РєР° РїСЂРё РїРµСЂРµРґР°С‡Рµ РґР°РЅРЅС‹С…: {e}"
             return
         if self.is_getting_AP_data:
-            self.label.text = "Процесс передачи завершен"
+            self.label.text = "РџСЂРѕС†РµСЃСЃ РїРµСЂРµРґР°С‡Рё Р·Р°РІРµСЂС€РµРЅ"
             self.is_getting_AP_data = False
             self.sent_AP_data = True
         self.AP_send_button.background_color = self.colors["grey"]
@@ -395,11 +466,11 @@ class main_app(App):
             "suitcase": [150, 250],
             }
         
-        max_width = 1920 #Какая максимальная ширина изображения в пикселях
-        max_dist = 500 #В пикселях относительно исходного изображения
-        max_movement = 150 #Сколько максимально в пикселях может переместиться объект типа car перед тем как система оповестит пользователя
+        max_width = 1920 #РљР°РєР°СЏ РјР°РєСЃРёРјР°Р»СЊРЅР°СЏ С€РёСЂРёРЅР° РёР·РѕР±СЂР°Р¶РµРЅРёСЏ РІ РїРёРєСЃРµР»СЏС…
+        max_dist = 500 #Р’ РїРёРєСЃРµР»СЏС… РѕС‚РЅРѕСЃРёС‚РµР»СЊРЅРѕ РёСЃС…РѕРґРЅРѕРіРѕ РёР·РѕР±СЂР°Р¶РµРЅРёСЏ
+        max_movement = 150 #РЎРєРѕР»СЊРєРѕ РјР°РєСЃРёРјР°Р»СЊРЅРѕ РІ РїРёРєСЃРµР»СЏС… РјРѕР¶РµС‚ РїРµСЂРµРјРµСЃС‚РёС‚СЊСЃСЏ РѕР±СЉРµРєС‚ С‚РёРїР° car РїРµСЂРµРґ С‚РµРј РєР°Рє СЃРёСЃС‚РµРјР° РѕРїРѕРІРµСЃС‚РёС‚ РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ
 
-        positions = {"Слева": [0, 0.25*max_width/2], "Чуть левее": [0.25*max_width/2, 0.75*max_width/2], "Спереди": [0.75*max_width/2, 1.25*max_width/2], "Чуть правее": [1.25*max_width/2, 1.75*max_width/2], "Справа": [1.75*max_width/2, max_width]}
+        positions = {"РЎР»РµРІР°": [0, 0.25*max_width/2], "Р§СѓС‚СЊ Р»РµРІРµРµ": [0.25*max_width/2, 0.75*max_width/2], "РЎРїРµСЂРµРґРё": [0.75*max_width/2, 1.25*max_width/2], "Р§СѓС‚СЊ РїСЂР°РІРµРµ": [1.25*max_width/2, 1.75*max_width/2], "РЎРїСЂР°РІР°": [1.75*max_width/2, max_width]}
 
         obj = answer["objects"]
         cords = answer["cords"]
@@ -409,7 +480,7 @@ class main_app(App):
         depth_dict = {}
     
 
-        #Алгоритм по отделению объектов по группам по глубине на изображении
+        #РђР»РіРѕСЂРёС‚Рј РїРѕ РѕС‚РґРµР»РµРЅРёСЋ РѕР±СЉРµРєС‚РѕРІ РїРѕ РіСЂСѓРїРїР°Рј РїРѕ РіР»СѓР±РёРЅРµ РЅР° РёР·РѕР±СЂР°Р¶РµРЅРёРё
         for i in range(len(obj)):
             match = False
             length = cords[i][2]-cords[i][0]
@@ -441,11 +512,11 @@ class main_app(App):
         print(groups_depth)
         #print(depth_dict)
 
-        #Алгоритм по нахождению аномальных движений машин и фиксированию их
+        #РђР»РіРѕСЂРёС‚Рј РїРѕ РЅР°С…РѕР¶РґРµРЅРёСЋ Р°РЅРѕРјР°Р»СЊРЅС‹С… РґРІРёР¶РµРЅРёР№ РјР°С€РёРЅ Рё С„РёРєСЃРёСЂРѕРІР°РЅРёСЋ РёС…
         alert_group = []
         frame_pool = self._build_frame_pool(obj, cords, centers, depth_dict)
         matches = self._match_frame_pool(frame_pool, max_movement)
-        print("пул создан")
+        print("РїСѓР» СЃРѕР·РґР°РЅ")
 
         for det_index, detection in frame_pool.items():
             track_id = matches.get(det_index)
@@ -464,7 +535,7 @@ class main_app(App):
                     if centers[det_index][0] <= positions[pos][1] and centers[det_index][0] >= positions[pos][0]:
                         position = pos
                         break
-                warning_text = f"!Внимание, {position} от вас резкое движение объекта {obj[det_index]}"
+                warning_text = f"!Р’РЅРёРјР°РЅРёРµ, {position} РѕС‚ РІР°СЃ СЂРµР·РєРѕРµ РґРІРёР¶РµРЅРёРµ РѕР±СЉРµРєС‚Р° {obj[det_index]}"
                 now = time.time()
                 last_warning_time = self.track_warning_times.get(track_id, 0)
                 if now - last_warning_time >= self.warning_cooldown_seconds and warning_text not in self.queue:
@@ -480,8 +551,8 @@ class main_app(App):
         self.object_tracks = {track_id: self.object_tracks[track_id] for track_id in active_track_ids}
         self.track_warning_times = {track_id: self.track_warning_times[track_id] for track_id in self.track_warning_times if track_id in active_track_ids}
         current_frame_id = self._push_frame_pool(frame_pool, obj, cords, centers, depth_dict)
-        print("отделение завершено")
-        #Алгоритм по отделению уже этих групп на группы близких по горизонтали и фильтрация объектов в группах
+        print("РѕС‚РґРµР»РµРЅРёРµ Р·Р°РІРµСЂС€РµРЅРѕ")
+        #РђР»РіРѕСЂРёС‚Рј РїРѕ РѕС‚РґРµР»РµРЅРёСЋ СѓР¶Рµ СЌС‚РёС… РіСЂСѓРїРї РЅР° РіСЂСѓРїРїС‹ Р±Р»РёР·РєРёС… РїРѕ РіРѕСЂРёР·РѕРЅС‚Р°Р»Рё Рё С„РёР»СЊС‚СЂР°С†РёСЏ РѕР±СЉРµРєС‚РѕРІ РІ РіСЂСѓРїРїР°С…
         def cluster(dist, n, List, max_dista):
             group = []
             center_n = centers[n]
@@ -512,15 +583,15 @@ class main_app(App):
                 #             group.append(k)
                 #             print(group, filter)
                 groups.append([i[0]]+[[sum(centers[k][0] for k in group)/len(group), sum(centers[k][1] for k in group)/len(group)] ]+group)
-        print("близость найдена")
-        #Фильтрация групп относительно фильтра важности объектов
+        print("Р±Р»РёР·РѕСЃС‚СЊ РЅР°Р№РґРµРЅР°")
+        #Р¤РёР»СЊС‚СЂР°С†РёСЏ РіСЂСѓРїРї РѕС‚РЅРѕСЃРёС‚РµР»СЊРЅРѕ С„РёР»СЊС‚СЂР° РІР°Р¶РЅРѕСЃС‚Рё РѕР±СЉРµРєС‚РѕРІ
         for i in filters:
             for j in groups.copy():
                 for k in j[2:]:
                     if obj[k]==i:
                         groups.remove(j)
                         groups.append(j)
-        print("группы сформированы")
+        print("РіСЂСѓРїРїС‹ СЃС„РѕСЂРјРёСЂРѕРІР°РЅС‹")
         print(groups)
         print(alert_group)
         print("_______________________________")
@@ -529,7 +600,7 @@ class main_app(App):
         self.Y_groups_stack = depth_dict
         self.current_frame_id = current_frame_id
 
-        #Формирование текста, описывающего кадр
+        #Р¤РѕСЂРјРёСЂРѕРІР°РЅРёРµ С‚РµРєСЃС‚Р°, РѕРїРёСЃС‹РІР°СЋС‰РµРіРѕ РєР°РґСЂ
         scene_signature = self._build_scene_signature(groups, obj, filters, positions)
         important_count = self._count_important_objects(groups, obj, filters)
         text = ""
@@ -541,7 +612,7 @@ class main_app(App):
                     position = pos
                     break
             objects_in_group = [obj[j] for j in i[2:]]
-            local_text+=position+" на расстоянии "+str(i[0])+" метров от Вас находится группа из " + ', '.join([str(objects_in_group.count(j))+" "+j for j in filters if objects_in_group.count(j)!=0])
+            local_text+=position+" РЅР° СЂР°СЃСЃС‚РѕСЏРЅРёРё "+str(i[0])+" РјРµС‚СЂРѕРІ РѕС‚ Р’Р°СЃ РЅР°С…РѕРґРёС‚СЃСЏ РіСЂСѓРїРїР° РёР· " + ', '.join([str(objects_in_group.count(j))+" "+j for j in filters if objects_in_group.count(j)!=0])
             text+=f"{local_text}; \n"
         if self._should_enqueue_scene(scene_signature, important_count):
             if text not in self.queue:
@@ -572,16 +643,16 @@ class main_app(App):
 
     def Server_start(self):
         IP = self._resolve_esp32_ip(self.mac, self.default_esp32_ip, "ESP32")
-        server_ip = self._resolve_esp32_ip(self.server_mac, self.default_server_ip, "server")
+        server_ip = self._resolve_esp32_ip(self.server_mac, self.default_server_ip, "server", False)
 
         server_url = f"http://{server_ip}:8000"
         
-        self._set_status(f"Подключаюсь к ESP32 по IP {IP}")
+        self._set_status(f"РџРѕРґРєР»СЋС‡Р°СЋСЃСЊ Рє ESP32 РїРѕ IP {IP}")
         i=0
         session = requests.Session()
         session.headers.update({"Connection": "keep-alive"})
 
-        #Начало сессии с головным сервером
+        #РќР°С‡Р°Р»Рѕ СЃРµСЃСЃРёРё СЃ РіРѕР»РѕРІРЅС‹Рј СЃРµСЂРІРµСЂРѕРј
 
         login = self.login
         password = hashlib.sha256(self.password.encode()).hexdigest()
@@ -592,7 +663,7 @@ class main_app(App):
             print(session_start.json())
             self.id = session_start.json()["id"]
         except HTTPError as error:
-            self.label.text = f"Ошибка при установлении соединения: {error.response.text}"
+            self.label.text = f"РћС€РёР±РєР° РїСЂРё СѓСЃС‚Р°РЅРѕРІР»РµРЅРёРё СЃРѕРµРґРёРЅРµРЅРёСЏ: {error.response.text}"
             return
         if self.voice_thread is None or not self.voice_thread.is_alive():
             self.voice_thread = threading.Thread(target=self.Voice_text, daemon=True)
@@ -609,11 +680,13 @@ class main_app(App):
                         if answer.json()["answer"]!="...":
                             self.AI_analyse(answer.json()["answer"])
                     except HTTPError as error:
-                        self.label.text = f"Ошибка при отправке изображения: {error.response.text}"
+                        self.label.text = f"РћС€РёР±РєР° РїСЂРё РѕС‚РїСЂР°РІРєРµ РёР·РѕР±СЂР°Р¶РµРЅРёСЏ: {error.response.text}"
                         return
                     i+=1
             except:
-                self.label.text = f"Не получается установить соединение. Повторяю попытку..."
+                self.label.text = f"РќРµ РїРѕР»СѓС‡Р°РµС‚СЃСЏ СѓСЃС‚Р°РЅРѕРІРёС‚СЊ СЃРѕРµРґРёРЅРµРЅРёРµ. РџРѕРІС‚РѕСЂСЏСЋ РїРѕРїС‹С‚РєСѓ..."
+                IP = self._resolve_esp32_ip(self.mac, self.default_esp32_ip, "ESP32")
+                time.sleep(1)
                 continue
             # files = {"img": open(f"./images/img_{i}.jpg", "rb")}
             # answer = requests.post(f"http://127.0.0.1:8000/session/{self.id}", files=files)
@@ -648,23 +721,30 @@ class main_app(App):
         self.centers_stack = []
         self.objects_stack= []
         self.Y_groups_stack = {}
-        # Запасной IP ESP32 для ПК и для Android-фоллбэка, если ARP не помог.
+        # Р—Р°РїР°СЃРЅРѕР№ IP ESP32 РґР»СЏ РџРљ Рё РґР»СЏ Android-С„РѕР»Р»Р±СЌРєР°, РµСЃР»Рё ARP РЅРµ РїРѕРјРѕРі.
         self.default_esp32_ip = "192.168.137.34"
-        # Запасной IP и MAC ноутбука/сервера до появления фиксированного домена.
+        # Р—Р°РїР°СЃРЅРѕР№ IP Рё MAC РЅРѕСѓС‚Р±СѓРєР°/СЃРµСЂРІРµСЂР° РґРѕ РїРѕСЏРІР»РµРЅРёСЏ С„РёРєСЃРёСЂРѕРІР°РЅРЅРѕРіРѕ РґРѕРјРµРЅР°.
         self.default_server_ip = "127.0.0.1"
         self.server_mac = "56-EB-3D-2D-FD-4D"
-        # Активные треки объектов между кадрами и счётчик новых track_id.
+        # UDP discovery РєРµС€ РЅР°Р№РґРµРЅРЅС‹С… СѓСЃС‚СЂРѕР№СЃС‚РІ Рё РїРѕС‚РѕРє, СЃР»СѓС€Р°СЋС‰РёР№ announce-РїР°РєРµС‚С‹.
+        self.discovery_port = 4210
+        self.discovery_wait_seconds = 6
+        self.discovered_hosts = {}
+        self.discovery_thread = None
+        self.discovery_running = False
+        self.discovery_socket = None
+        # РђРєС‚РёРІРЅС‹Рµ С‚СЂРµРєРё РѕР±СЉРµРєС‚РѕРІ РјРµР¶РґСѓ РєР°РґСЂР°РјРё Рё СЃС‡С‘С‚С‡РёРє РЅРѕРІС‹С… track_id.
         self.object_tracks = {}
         self.next_track_id = 1
-        # Сырые frame_pool'ы последних кадров и счётчик новых frame_id.
+        # РЎС‹СЂС‹Рµ frame_pool'С‹ РїРѕСЃР»РµРґРЅРёС… РєР°РґСЂРѕРІ Рё СЃС‡С‘С‚С‡РёРє РЅРѕРІС‹С… frame_id.
         self.frame_history = {}
         self.max_frame_history = 50
         self.next_frame_id = 1
         self.current_frame_id = None
-        # Очередь озвучки и её максимальный размер.
+        # РћС‡РµСЂРµРґСЊ РѕР·РІСѓС‡РєРё Рё РµС‘ РјР°РєСЃРёРјР°Р»СЊРЅС‹Р№ СЂР°Р·РјРµСЂ.
         self.queue = []
         self.max_queue_len = 15
-        # Backend озвучки: Android TTS в проде и консольная симуляция на ПК.
+        # Backend РѕР·РІСѓС‡РєРё: Android TTS РІ РїСЂРѕРґРµ Рё РєРѕРЅСЃРѕР»СЊРЅР°СЏ СЃРёРјСѓР»СЏС†РёСЏ РЅР° РџРљ.
         self.voice_thread = None
         self.voice_backend = None
         self.voice_backend_ready = False
@@ -675,10 +755,10 @@ class main_app(App):
         self.android_tts_class = None
         self.pending_tts = None
         self.console_voice_busy_until = 0
-        # Последняя озвученная сигнатура сцены для отсечения одинаковых описаний.
+        # РџРѕСЃР»РµРґРЅСЏСЏ РѕР·РІСѓС‡РµРЅРЅР°СЏ СЃРёРіРЅР°С‚СѓСЂР° СЃС†РµРЅС‹ РґР»СЏ РѕС‚СЃРµС‡РµРЅРёСЏ РѕРґРёРЅР°РєРѕРІС‹С… РѕРїРёСЃР°РЅРёР№.
         self.last_scene_signature = None
         self.last_important_count = 0
-        # Время последних варнингов по track_id, чтобы не спамить одним объектом.
+        # Р’СЂРµРјСЏ РїРѕСЃР»РµРґРЅРёС… РІР°СЂРЅРёРЅРіРѕРІ РїРѕ track_id, С‡С‚РѕР±С‹ РЅРµ СЃРїР°РјРёС‚СЊ РѕРґРЅРёРј РѕР±СЉРµРєС‚РѕРј.
         self.track_warning_times = {}
         self.warning_cooldown_seconds = 2.5
 
@@ -686,15 +766,15 @@ class main_app(App):
         self.is_getting_AP_data = False
         self.sent_AP_data = False
         self.started_server = False
-        self.labels = {"start": "Устанавливаю полное соединение с очками", "stop": "Выключаю соединение", "deny": "Сначала вам необходимо передать данные о точке доступа"}
+        self.labels = {"start": "РЈСЃС‚Р°РЅР°РІР»РёРІР°СЋ РїРѕР»РЅРѕРµ СЃРѕРµРґРёРЅРµРЅРёРµ СЃ РѕС‡РєР°РјРё", "stop": "Р’С‹РєР»СЋС‡Р°СЋ СЃРѕРµРґРёРЅРµРЅРёРµ", "deny": "РЎРЅР°С‡Р°Р»Р° РІР°Рј РЅРµРѕР±С…РѕРґРёРјРѕ РїРµСЂРµРґР°С‚СЊ РґР°РЅРЅС‹Рµ Рѕ С‚РѕС‡РєРµ РґРѕСЃС‚СѓРїР°"}
         self.img = b""
 
         self.colors = {"green": (0,1,0,1), "red": (1,0,0,1), "grey": (1,1,1,1)}
 
         db = self.load_db()
-        name = socket.gethostname()
+        # name = socket.gethostname()
         IP = "10.243.62.9"
-        print(IP, name)
+        # print(IP, name)
         db["AP_DATA"]["ip"] = IP
         self.save_db(db)
         
@@ -728,39 +808,39 @@ class main_app(App):
     def create_main_layout(self):
         self.layout = BoxLayout(orientation="vertical")
 
-        #Кнопка регистрации
+        #РљРЅРѕРїРєР° СЂРµРіРёСЃС‚СЂР°С†РёРё
         button_layout = BoxLayout(orientation="horizontal")
         button_layout.size_hint_y = None
         button_layout.height = 75
-        self.Register_button = Button(text="Зарегистрироваться", size=(10,10))
+        self.Register_button = Button(text="Р—Р°СЂРµРіРёСЃС‚СЂРёСЂРѕРІР°С‚СЊСЃСЏ", size=(10,10))
         self.Register_button.bind(on_press=self.register)
-        button_layout.add_widget(Label(text=self.login if self.login!=None else "Вы не вошли в аккаунт", font_size="12sp"))
+        button_layout.add_widget(Label(text=self.login if self.login!=None else "Р’С‹ РЅРµ РІРѕС€Р»Рё РІ Р°РєРєР°СѓРЅС‚", font_size="12sp"))
         button_layout.add_widget(self.Register_button)
         self.layout.add_widget(button_layout)
 
         
         #---
 
-        self.layout.add_widget(Label(text="Данные вашей точки доступа", font_size="24sp" ))
+        self.layout.add_widget(Label(text="Р”Р°РЅРЅС‹Рµ РІР°С€РµР№ С‚РѕС‡РєРё РґРѕСЃС‚СѓРїР°", font_size="24sp" ))
         big_layout = BoxLayout(orientation="vertical")
         ssid_layout = BoxLayout(orientation="horizontal")
         h=80
-        self.SSID_Input = TextInput(text=(self.SSID if self.SSID!=None and self.SSID!="" else "Введите SSID"), halign="center", size_hint_y = None, multiline=False, height=h)
+        self.SSID_Input = TextInput(text=(self.SSID if self.SSID!=None and self.SSID!="" else "Р’РІРµРґРёС‚Рµ SSID"), halign="center", size_hint_y = None, multiline=False, height=h)
         ssid_layout.add_widget(Label(text="SSID: ",size_hint_y = None, height=h, font_size="16sp"))
         ssid_layout.add_widget(self.SSID_Input)
         big_layout.add_widget(ssid_layout)
         
         password_layout = BoxLayout(orientation="horizontal")
-        self.PSWRD_Input = TextInput(text=(self.PSWRD if self.PSWRD!=None and self.PSWRD!="" else "Введите пароль"), halign="center")
-        password_layout.add_widget(Label(text="Пароль: ", font_size="16sp"))
+        self.PSWRD_Input = TextInput(text=(self.PSWRD if self.PSWRD!=None and self.PSWRD!="" else "Р’РІРµРґРёС‚Рµ РїР°СЂРѕР»СЊ"), halign="center")
+        password_layout.add_widget(Label(text="РџР°СЂРѕР»СЊ: ", font_size="16sp"))
         password_layout.add_widget(self.PSWRD_Input)
         big_layout.add_widget(password_layout)
         self.layout.add_widget(big_layout)
 
-        self.AP_send_button = Button(text="Начать передачу")
-        self.Server_start_button = Button(text="Установить соединение с очками")
+        self.AP_send_button = Button(text="РќР°С‡Р°С‚СЊ РїРµСЂРµРґР°С‡Сѓ")
+        self.Server_start_button = Button(text="РЈСЃС‚Р°РЅРѕРІРёС‚СЊ СЃРѕРµРґРёРЅРµРЅРёРµ СЃ РѕС‡РєР°РјРё")
         self.Server_start_button.bind(on_press=self.Server_start_func)
-        self.Terminate_button = Button(text="Принудительно завершить текущий процесс", background_color=(1,0,0,1))
+        self.Terminate_button = Button(text="РџСЂРёРЅСѓРґРёС‚РµР»СЊРЅРѕ Р·Р°РІРµСЂС€РёС‚СЊ С‚РµРєСѓС‰РёР№ РїСЂРѕС†РµСЃСЃ", background_color=(1,0,0,1))
         self.Terminate_button.bind(on_press=self.Terminate_func)
         self.AP_send_button.bind(on_press=self.AP_data_send_func)
         #self.layout.add_widget(self.SSID_Input)
@@ -776,21 +856,21 @@ class main_app(App):
         button_layout = BoxLayout(orientation="horizontal")
         button_layout.size_hint_y = None
         button_layout.height = 50
-        register_cancel = Button(text="Назад", height=30)
+        register_cancel = Button(text="РќР°Р·Р°Рґ", height=30)
         register_cancel.bind(on_press=self.cancel_register)
         register_cancel.background_color = self.colors["red"]
         button_layout.add_widget(Label(text="   ", font_size="12sp"))
         button_layout.add_widget(register_cancel)
         self.login_layout.add_widget(button_layout)
 
-        self.login_layout_label = Label(text="Регистрация аккаунта/Вход в аккаунт", font_size="20sp")
+        self.login_layout_label = Label(text="Р РµРіРёСЃС‚СЂР°С†РёСЏ Р°РєРєР°СѓРЅС‚Р°/Р’С…РѕРґ РІ Р°РєРєР°СѓРЅС‚", font_size="20sp")
         self.login_layout.add_widget(self.login_layout_label)
-        self.login_input = TextInput(text=self.login if self.login!=None else "Введите логин", halign="center", size_hint_y = None, font_size="20sp")
+        self.login_input = TextInput(text=self.login if self.login!=None else "Р’РІРµРґРёС‚Рµ Р»РѕРіРёРЅ", halign="center", size_hint_y = None, font_size="20sp")
         self.login_layout.add_widget(self.login_input)
-        self.password_input = TextInput(text=self.password if self.password!=None else "Введите пароль", halign="center", size_hint_y = None, font_size="20sp")
+        self.password_input = TextInput(text=self.password if self.password!=None else "Р’РІРµРґРёС‚Рµ РїР°СЂРѕР»СЊ", halign="center", size_hint_y = None, font_size="20sp")
         self.login_layout.add_widget(self.password_input)
-        submit = Button(text="Зарегистрироваться")
-        Register_button = Button(text="Войти")
+        submit = Button(text="Р—Р°СЂРµРіРёСЃС‚СЂРёСЂРѕРІР°С‚СЊСЃСЏ")
+        Register_button = Button(text="Р’РѕР№С‚Рё")
         submit.bind(on_press=self.submit_register)
         self.login_layout.add_widget(submit)
         self.login_layout.add_widget(Register_button)
@@ -798,6 +878,14 @@ class main_app(App):
 
     
     def on_stop(self):
+        self.discovery_running = False
+        if self.discovery_socket is not None:
+            try:
+                self.discovery_socket.close()
+            except OSError:
+                pass
+            self.discovery_socket = None
+
         if self.voice_backend == "android_tts" and self.tts_engine is not None:
             try:
                 self.tts_engine.stop()
@@ -815,7 +903,7 @@ class main_app(App):
         self.save_db(db)
         print("Commiting all changes")
 
-    #Функции для кнопок
+    #Р¤СѓРЅРєС†РёРё РґР»СЏ РєРЅРѕРїРѕРє
 
     def AP_data_send_func(self, instance):
         if not self.is_getting_AP_data:  
@@ -824,7 +912,7 @@ class main_app(App):
             self.is_getting_AP_data = True
             self.AP_send_button.background_color = self.colors["green"]
         else:
-             self.label.text="Передача уже началась!"
+             self.label.text="РџРµСЂРµРґР°С‡Р° СѓР¶Рµ РЅР°С‡Р°Р»Р°СЃСЊ!"
 
     def Server_start_func(self, instance):
         if self.sent_AP_data and not self.started_server:
@@ -879,3 +967,4 @@ class main_app(App):
 
 if __name__ == "__main__":
     main_app().run()
+
