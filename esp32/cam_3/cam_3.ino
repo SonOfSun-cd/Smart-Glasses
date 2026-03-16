@@ -104,11 +104,10 @@ void setup() {
   Serial.println(IP_check);
   Serial.println(String(IP_check).length());
   
-  //GetMACaddress(); //Получение MAC адреса
   if (String(IP_check).length()==3)
   {
     Serial.println("Запускаю процесс получения данных точки доступа");
-    StartAP();
+    StartAP(); //Первоначальная настройка с передачей и получением данных точки доступа
   }
   else 
   {

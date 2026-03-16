@@ -32,7 +32,7 @@ def AI_analyse(id, image):
     #global queue, model
     print("Got image")
     img = Image.open(io.BytesIO(image))
-    img.save(f"images/image_{count}.png")
+    # img.save(f"images/image_{count}.png")
     count+=1
     frame = model.predict(img, conf=0.5)
     objects = []
@@ -54,7 +54,7 @@ def AI_analyse(id, image):
 
     
 def createId():
-    id = ''.join(random.choices(random.choices("AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz0123456789", k=35),k=52))
+    id = ''.join(random.choices("AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz0123456789",k=52))
     return id
 
 
@@ -112,9 +112,6 @@ async def register(
     login: str,
     password: str,
     db: Session = Depends(get_db)):
-    # #Позже хэширование будет происходить на стороне клиента
-    # login = hashlib.sha256(login.encode()).hexdigest()
-    # password = hashlib.sha256(password.encode()).hexdigest()
 
     a = db.query(models.User).filter(models.User.login == login).first()
     print(a)

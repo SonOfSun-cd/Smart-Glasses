@@ -10,6 +10,7 @@ from kivy.uix.label import Label
 from kivy.uix.button import Button
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.textinput import TextInput
+from kivy.utils import platform
 
 import time
 import requests
@@ -19,9 +20,229 @@ import socket
 import json
 import hashlib
 import pyttsx3
+import multiprocessing
 
 
 class main_app(App):
+    def _build_frame_pool(self, obj, cords, centers, depth_dict):
+        frame_pool = {}
+        for i in range(len(obj)):
+            frame_pool[i] = {
+                "index": i,
+                "class": obj[i],
+                "cords": cords[i],
+                "center": centers[i],
+                "depth": depth_dict.get(f"{i}"),
+                "track_id": None,
+            }
+        return frame_pool
+
+    def _push_frame_pool(self, frame_pool, obj, cords, centers, depth_dict):
+        frame_id = self.next_frame_id
+        self.next_frame_id += 1
+
+        snapshot = {
+            "frame_id": frame_id,
+            "frame_pool": {i: frame_pool[i].copy() for i in frame_pool},
+            "objects": obj[:],
+            "cords": [cord[:] for cord in cords],
+            "centers": [center[:] for center in centers],
+            "depth_dict": depth_dict.copy(),
+        }
+        self.frame_history[frame_id] = snapshot
+
+        if len(self.frame_history) > self.max_frame_history:
+            oldest_frame_id = next(iter(self.frame_history))
+            del self.frame_history[oldest_frame_id]
+
+        return frame_id
+
+    def _normalize_mac(self, mac):
+        return mac.strip().lower().replace("-", ":") if mac else ""
+
+    def _set_status(self, text):
+        if hasattr(self, "label") and self.label is not None:
+            self.label.text = str(text)
+
+    def _read_android_arp_table(self):
+        try:
+            from jnius import autoclass
+
+            Runtime = autoclass("java.lang.Runtime")
+            InputStreamReader = autoclass("java.io.InputStreamReader")
+            BufferedReader = autoclass("java.io.BufferedReader")
+
+            for command in ("ip neigh", "cat /proc/net/arp"):
+                process = Runtime.getRuntime().exec(command)
+                reader = BufferedReader(InputStreamReader(process.getInputStream()))
+                arp_lines = []
+
+                while True:
+                    line = reader.readLine()
+                    if line is None:
+                        break
+                    arp_lines.append(str(line))
+
+                reader.close()
+                process.waitFor()
+                if arp_lines:
+                    return arp_lines
+
+            return []
+        except Exception as error:
+            self._set_status(f"Ошибка чтения ARP: {error}")
+            return []
+
+    def _resolve_esp32_ip(self):
+        if platform != "android":
+            return self.default_esp32_ip
+
+        target_mac = self._normalize_mac(self.mac)
+        if not target_mac:
+            self._set_status("MAC ESP32 не задан, использую запасной IP")
+            return self.default_esp32_ip
+
+        arp_lines = self._read_android_arp_table()
+        for line in arp_lines:
+            normalized_line = line.lower()
+            if target_mac in normalized_line:
+                parts = line.split()
+                if parts:
+                    self._set_status(f"ESP32 найден в ARP: {parts[0]}")
+                    return parts[0]
+
+        self._set_status("MAC ESP32 не найден в ARP, использую запасной IP")
+        return self.default_esp32_ip
+
+    def _build_scene_signature(self, groups, obj, filters, positions):
+        signature = []
+
+        for group in groups:
+            position = ""
+            for pos in positions:
+                if group[1][0] <= positions[pos][1] and group[1][0] >= positions[pos][0]:
+                    position = pos
+                    break
+
+            objects_in_group = [obj[j] for j in group[2:]]
+            counts = tuple((filter_name, objects_in_group.count(filter_name)) for filter_name in filters if objects_in_group.count(filter_name) != 0)
+            depth_bucket = round(group[0], 1)
+            signature.append((position, depth_bucket, counts))
+
+        return tuple(sorted(signature))
+
+    def _count_important_objects(self, groups, obj, filters, limit=3):
+        important_filters = filters[:limit]
+        count = 0
+
+        for group in groups:
+            for index in group[2:]:
+                if obj[index] in important_filters:
+                    count += 1
+
+        return count
+
+    def _should_enqueue_scene(self, scene_signature, important_count):
+        if not scene_signature:
+            return False
+
+        if self.last_scene_signature is None:
+            self.last_scene_signature = scene_signature
+            self.last_important_count = important_count
+            return True
+
+        important_delta = important_count - self.last_important_count
+        changed = scene_signature != self.last_scene_signature
+
+        if changed or important_delta >= 1:
+            self.last_scene_signature = scene_signature
+            self.last_important_count = important_count
+            return True
+
+        return False
+
+    def _match_frame_pool(self, frame_pool, max_movement):
+        matches = {}
+        used_tracks = set()
+        candidates = []
+
+        for det_index, detection in frame_pool.items():
+            for track_id, track in self.object_tracks.items():
+                last_detection = track["history"][-1]
+                if detection["class"] != track["class"]:
+                    continue
+
+                depth_now = detection["depth"]
+                depth_prev = last_detection.get("depth")
+                if depth_now is not None and depth_prev is not None and abs(depth_now - depth_prev) > 0.7:
+                    continue
+
+                if len(track["history"]) >= 2:
+                    prev_center = track["history"][-2]["center"]
+                    last_center = last_detection["center"]
+                    predicted_center = [
+                        last_center[0] + (last_center[0] - prev_center[0]),
+                        last_center[1] + (last_center[1] - prev_center[1]),
+                    ]
+                else:
+                    predicted_center = last_detection["center"]
+
+                dx = detection["center"][0] - predicted_center[0]
+                dy = detection["center"][1] - predicted_center[1]
+                distance = (dx**2 + dy**2) ** 0.5
+                track_depth = depth_now if depth_now is not None else depth_prev
+                allowed_distance = max_movement * (track_depth if track_depth is not None else 1)
+
+                if distance <= allowed_distance * 1.4:
+                    depth_penalty = 0 if depth_now is None or depth_prev is None else abs(depth_now - depth_prev) * 50
+                    candidates.append((distance + depth_penalty, det_index, track_id))
+
+        for _, det_index, track_id in sorted(candidates, key=lambda x: x[0]):
+            if det_index in matches or track_id in used_tracks:
+                continue
+            matches[det_index] = track_id
+            used_tracks.add(track_id)
+
+        return matches
+
+    def _is_sharp_motion(self, track, detection, max_movement):
+        if len(track["history"]) < 1:
+            return False
+
+        last_detection = track["history"][-1]
+        depth_now = detection.get("depth")
+        depth_prev = last_detection.get("depth")
+        scale = 1
+        if depth_now is not None and depth_prev is not None:
+            scale = max((depth_now + depth_prev) / 2, 0.3)
+        threshold = max_movement * scale
+
+        move_vector = [
+            detection["center"][0] - last_detection["center"][0],
+            detection["center"][1] - last_detection["center"][1],
+        ]
+        move_distance = (move_vector[0] ** 2 + move_vector[1] ** 2) ** 0.5
+
+        if len(track["history"]) < 2:
+            return move_distance >= threshold
+
+        prev_detection = track["history"][-2]
+        prev_vector = [
+            last_detection["center"][0] - prev_detection["center"][0],
+            last_detection["center"][1] - prev_detection["center"][1],
+        ]
+        prev_distance = (prev_vector[0] ** 2 + prev_vector[1] ** 2) ** 0.5
+
+        direction_change = 1
+        if move_distance > 0 and prev_distance > 0:
+            dot = move_vector[0] * prev_vector[0] + move_vector[1] * prev_vector[1]
+            direction_change = dot / (move_distance * prev_distance)
+
+        return move_distance >= threshold and (
+            prev_distance < threshold * 0.6
+            or direction_change < 0.4
+            or move_distance > prev_distance * 1.7
+        )
     def load_db(self):
         with open("./db.json", "r") as f:
             return json.load(f)
@@ -106,24 +327,26 @@ class main_app(App):
             des_l = distance_filter[obj[i]][0]
             des_h = distance_filter[obj[i]][1]
             height = cords[i][3]-cords[i][1]
+            
             if groups_depth!=[]:
                 distance = des_l/length
+
                 if abs(des_l/length-des_h/height)>0.5:
                     distance = distance if length/height > des_l/des_h else des_h/height
+
                 for j in range(len(groups_depth)):
                     if abs(groups_depth[j][0]-distance) <= 0.2*distance:
                         groups_depth[j].append(i)
                         groups_depth[j][0]=(groups_depth[j][0]+distance)/2
-                        if obj[i]=="car":
-                            depth_dict.update({f"{i}": groups_depth[j][0]})
+                        depth_dict.update({f"{i}": groups_depth[j][0]})
                         match=True
                         break
+                    
             if groups_depth==[] or not match:
                 distance = des_l/length
                 if abs(des_l/length-des_h/height)>0.5:
                     distance = distance if length/height > des_l/des_h else des_h/height
-                if obj[i]=="car":
-                    depth_dict.update({f"{i}": distance})
+                depth_dict.update({f"{i}": distance})
                 groups_depth.append([distance, i]) 
         print(obj)
         print(groups_depth)
@@ -131,31 +354,42 @@ class main_app(App):
 
         #Алгоритм по нахождению аномальных движений машин и фиксированию их
         alert_group = []
-        if self.previous_centers!=[] and "car" in self.previous_objects:
-            group_now = [i for i in range(len(obj)) if obj[i]=="car"]
-            group_previous = [i for i in range(len(self.previous_objects)) if self.previous_objects[i]=="car"]
-            for now in group_now:
-                min_dist = 100000
-                ind = 0
-                center_now = centers[now]
-                for prev in group_previous:
-                    center_prev = self.previous_centers[prev]
-                    distance = ((center_now[0]-center_prev[0])**2+(center_now[1]-center_prev[1])**2)**0.5
-                    if abs(depth_dict[str(now)]-self.previous_Y_groups[str(prev)])<=0.5 and min_dist>distance:
-                        min_dist = distance
-                        ind = prev
-                #print(ind)
-                if min_dist>=max_movement*(depth_dict[str(now)]+self.previous_Y_groups[str(ind)])/2:
-                    alert_group.append(now)
-                    group_previous.remove(ind)
-                    position = ""
-                    for pos in positions:
-                        if centers[now][0]<=positions[pos][1] and centers[now][0]>=positions[pos][0]:
-                            position = pos
-                            break
-                    self.queue.append(f"!Внимание, {position} от вас резкое движение объекта {obj[now]}")
-            #abs(self.previous_centers[prev]-centers[now])<=max_movement*(depth_dict[str(now)]+self.previous_Y_groups[str(prev)])/2
-            pass
+        frame_pool = self._build_frame_pool(obj, cords, centers, depth_dict)
+        matches = self._match_frame_pool(frame_pool, max_movement)
+
+        for det_index, detection in frame_pool.items():
+            track_id = matches.get(det_index)
+            if track_id is None:
+                track_id = self.next_track_id
+                self.next_track_id += 1
+                self.object_tracks[track_id] = {"class": detection["class"], "history": []}
+
+            detection["track_id"] = track_id
+            track = self.object_tracks[track_id]
+
+            if detection["class"] == "person" and self._is_sharp_motion(track, detection, max_movement):
+                alert_group.append(det_index)
+                position = ""
+                for pos in positions:
+                    if centers[det_index][0] <= positions[pos][1] and centers[det_index][0] >= positions[pos][0]:
+                        position = pos
+                        break
+                warning_text = f"!Внимание, {position} от вас резкое движение объекта {obj[det_index]}"
+                now = time.time()
+                last_warning_time = self.track_warning_times.get(track_id, 0)
+                if now - last_warning_time >= self.warning_cooldown_seconds and warning_text not in self.queue:
+                    if len(self.queue) >= self.max_queue_len:
+                        self.queue = self.queue[1:]
+                    self.queue.append(warning_text)
+                    self.track_warning_times[track_id] = now
+
+            track["history"].append({"center": detection["center"], "depth": detection["depth"], "index": det_index})
+            track["history"] = track["history"][-3:]
+
+        active_track_ids = {frame_pool[i]["track_id"] for i in frame_pool}
+        self.object_tracks = {track_id: self.object_tracks[track_id] for track_id in active_track_ids}
+        self.track_warning_times = {track_id: self.track_warning_times[track_id] for track_id in self.track_warning_times if track_id in active_track_ids}
+        current_frame_id = self._push_frame_pool(frame_pool, obj, cords, centers, depth_dict)
         
         #Алгоритм по отделению уже этих групп на группы близких по горизонтали и фильтрация объектов в группах
         def cluster(dist, n, List, max_dista):
@@ -165,7 +399,7 @@ class main_app(App):
                 center_i = centers[i]
                 if ((center_n[0]-center_i[0])**2+(center_n[1]-center_i[1])**2)**0.5*dist<max_dista:
                     group.append(i)
-                    b=List
+                    b=List.copy()
                     b.remove(i)
                     if n in List:
                         b.remove(n)
@@ -191,7 +425,7 @@ class main_app(App):
         
         #Фильтрация групп относительно фильтра важности объектов
         for i in filters:
-            for j in groups:
+            for j in groups.copy():
                 for k in j[2:]:
                     if obj[k]==i:
                         groups.remove(j)
@@ -200,11 +434,14 @@ class main_app(App):
         print(groups)
         print(alert_group)
         print("_______________________________")
-        self.previous_centers = centers
-        self.previous_objects = obj
-        self.previous_Y_groups = depth_dict
+        self.centers_stack = centers
+        self.objects_stack = obj
+        self.Y_groups_stack = depth_dict
+        self.current_frame_id = current_frame_id
 
         #Формирование текста, описывающего кадр
+        scene_signature = self._build_scene_signature(groups, obj, filters, positions)
+        important_count = self._count_important_objects(groups, obj, filters)
         text = ""
         for i in groups:
             local_text = ""
@@ -214,9 +451,13 @@ class main_app(App):
                     position = pos
                     break
             objects_in_group = [obj[j] for j in i[2:]]
-            local_text+=position+" на расстоянии приблизительно "+str(i[0])+" метров от Вас находится группа из " + ', '.join([str(objects_in_group.count(j))+" "+j for j in filters if objects_in_group.count(j)!=0])
+            local_text+=position+" на расстоянии "+str(i[0])+" метров от Вас находится группа из " + ', '.join([str(objects_in_group.count(j))+" "+j for j in filters if objects_in_group.count(j)!=0])
             text+=f"{local_text}; \n"
-        self.queue.append(text)
+        if self._should_enqueue_scene(scene_signature, important_count):
+            if text not in self.queue:
+                if len(self.queue) >= self.max_queue_len:
+                    self.queue = self.queue[1:]
+                self.queue.append(text)
         print(text)
         print(self.queue)
 
@@ -227,16 +468,21 @@ class main_app(App):
             if self.queue:
                 text = ""
                 rate = 230
-                if any("!" in text for text in self.queue):
-                    text = [text for text in self.queue if "!" in text][0]
+                dangers = [text for text in self.queue if "!" in text]
+                if dangers:
+                    text = dangers[0]
                     self.queue.remove(text)
                     rate=300
+                    if self.say is not None and self.say.is_alive():
+                        self.say.terminate()
                 else:
                     text = self.queue[0]
                     self.queue = self.queue[1:]
                     print(text)
-                self.say = threading.Thread(target=self.Voice_process, args=(text, rate))
-                self.say.start()
+                if self.say is None or not self.say.is_alive():
+                    self.say = multiprocessing.Process(target=self.Voice_process, args=(text, rate))
+                    self.say.start()
+            time.sleep(0.05)
 
 
     def Voice_process(self, text, rate):
@@ -247,14 +493,15 @@ class main_app(App):
 
 
     def Server_start(self):
-        IP = "192.168.137.85"
+        IP = self._resolve_esp32_ip()
+        self._set_status(f"Подключаюсь к ESP32 по IP {IP}")
         i=0
         session = requests.Session()
         session.headers.update({"Connection": "keep-alive"})
 
         #Начало сессии с головным сервером
 
-        login = hashlib.sha256(self.login.encode()).hexdigest()
+        login = self.login
         password = hashlib.sha256(self.password.encode()).hexdigest()
         try:
             session_start = requests.get(f"http://127.0.0.1:8000/start/{login}/{password}")
@@ -265,7 +512,8 @@ class main_app(App):
         except HTTPError as error:
             self.label.text = f"Ошибка при установлении соединения: {error.response.text}"
             return
-            
+        f = threading.Thread(target=self.Voice_text)
+        f.start()
         while self.started_server:
             try:
                 img = session.get(f"http://{IP}:3000/img")
@@ -276,8 +524,7 @@ class main_app(App):
                         answer.raise_for_status()
 
                         if answer.json()["answer"]!="...":
-                            f = threading.Thread(target=self.AI_analyse, args=(answer.json()["answer"],))
-                            f.start()
+                            self.AI_analyse(answer.json()["answer"])
                     except HTTPError as error:
                         self.label.text = f"Ошибка при отправке изображения: {error.response.text}"
                         return
@@ -293,9 +540,15 @@ class main_app(App):
         #server = subprocess.Popen(["py","server.py"], shell=True)
         #ai_analyse = subprocess.Popen(["py", "AI.py"], shell=True)
         self.label.text = "..."
-        self.previous_centers = []
-        self.previous_objects = []
-        self.previous_Y_groups = []
+        self.object_tracks = {}
+        self.next_track_id = 1
+        self.frame_history = {}
+        self.max_frame_history = 50
+        self.next_frame_id = 1
+        self.current_frame_id = None
+        self.last_scene_signature = None
+        self.last_important_count = 0
+        self.track_warning_times = {}
         return
     
     def terminate_url(self):
@@ -309,10 +562,30 @@ class main_app(App):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-        self.previous_centers = []
-        self.previous_objects = []
-        self.previous_Y_groups = {}
+        self.centers_stack = []
+        self.objects_stack= []
+        self.Y_groups_stack = {}
+        # Запасной IP ESP32 для ПК и для Android-фоллбэка, если ARP не помог.
+        self.default_esp32_ip = "192.168.137.85"
+        # Активные треки объектов между кадрами и счётчик новых track_id.
+        self.object_tracks = {}
+        self.next_track_id = 1
+        # Сырые frame_pool'ы последних кадров и счётчик новых frame_id.
+        self.frame_history = {}
+        self.max_frame_history = 50
+        self.next_frame_id = 1
+        self.current_frame_id = None
+        # Очередь озвучки и её максимальный размер.
         self.queue = []
+        self.max_queue_len = 15
+        # Текущий процесс озвучки.
+        self.say = None
+        # Последняя озвученная сигнатура сцены для отсечения одинаковых описаний.
+        self.last_scene_signature = None
+        self.last_important_count = 0
+        # Время последних варнингов по track_id, чтобы не спамить одним объектом.
+        self.track_warning_times = {}
+        self.warning_cooldown_seconds = 2.5
 
         self.check = "Hello!"
         self.is_getting_AP_data = False
@@ -481,7 +754,7 @@ class main_app(App):
         self.login = self.login_input.text
         self.password = self.password_input.text
 
-        login = hashlib.sha256(self.login.encode()).hexdigest()
+        login = self.login
         password = hashlib.sha256(self.password.encode()).hexdigest()
 
 
