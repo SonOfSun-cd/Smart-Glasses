@@ -93,14 +93,17 @@ class main_app(App):
             self._set_status(f"Ошибка чтения ARP: {error}")
             return []
 
-    def _resolve_esp32_ip(self):
-        if platform != "android":
-            return self.default_esp32_ip
+    def _resolve_esp32_ip(self, target_mac=None, default_ip=None, target_name="ESP32"):
+        if default_ip is None:
+            default_ip = self.default_esp32_ip
 
-        target_mac = self._normalize_mac(self.mac)
+        if platform != "android":
+            return default_ip
+
+        target_mac = self._normalize_mac(target_mac)
         if not target_mac:
-            self._set_status("MAC ESP32 не задан, использую запасной IP")
-            return self.default_esp32_ip
+            self._set_status(f"MAC {target_name} не задан, использую запасной IP")
+            return default_ip
 
         arp_lines = self._read_android_arp_table()
         for line in arp_lines:
@@ -108,11 +111,11 @@ class main_app(App):
             if target_mac in normalized_line:
                 parts = line.split()
                 if parts:
-                    self._set_status(f"ESP32 найден в ARP: {parts[0]}")
+                    self._set_status(f"{target_name} найден в ARP: {parts[0]}")
                     return parts[0]
 
-        self._set_status("MAC ESP32 не найден в ARP, использую запасной IP")
-        return self.default_esp32_ip
+        self._set_status(f"MAC {target_name} не найден в ARP, использую запасной IP")
+        return default_ip
 
     def _build_scene_signature(self, groups, obj, filters, positions):
         signature = []
@@ -493,7 +496,11 @@ class main_app(App):
 
 
     def Server_start(self):
-        IP = self._resolve_esp32_ip()
+        IP = self._resolve_esp32_ip(self.mac, self.default_esp32_ip, "ESP32")
+        server_ip = self._resolve_esp32_ip(self.server_mac, self.default_server_ip, "server")
+
+        server_url = f"http://{server_ip}:8000"
+        
         self._set_status(f"Подключаюсь к ESP32 по IP {IP}")
         i=0
         session = requests.Session()
@@ -504,7 +511,7 @@ class main_app(App):
         login = self.login
         password = hashlib.sha256(self.password.encode()).hexdigest()
         try:
-            session_start = requests.get(f"http://127.0.0.1:8000/start/{login}/{password}")
+            session_start = requests.get(f"{server_url}/start/{login}/{password}")
             session_start.raise_for_status()
 
             print(session_start.json())
@@ -520,7 +527,7 @@ class main_app(App):
                 if img.status_code == 200:
                     files = {"img": img.content}
                     try:
-                        answer = session.post(f"http://127.0.0.1:8000/session/{self.id}", files=files)
+                        answer = session.post(f"{server_url}/session/{self.id}", files=files)
                         answer.raise_for_status()
 
                         if answer.json()["answer"]!="...":
@@ -567,6 +574,9 @@ class main_app(App):
         self.Y_groups_stack = {}
         # Запасной IP ESP32 для ПК и для Android-фоллбэка, если ARP не помог.
         self.default_esp32_ip = "192.168.137.85"
+        # Запасной IP и MAC ноутбука/сервера до появления фиксированного домена.
+        self.default_server_ip = "127.0.0.1"
+        self.server_mac = ""
         # Активные треки объектов между кадрами и счётчик новых track_id.
         self.object_tracks = {}
         self.next_track_id = 1
