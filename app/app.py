@@ -20,7 +20,6 @@ import socket
 import json
 import hashlib
 import pyttsx3
-import multiprocessing
 
 
 class main_app(App):
@@ -359,6 +358,7 @@ class main_app(App):
         alert_group = []
         frame_pool = self._build_frame_pool(obj, cords, centers, depth_dict)
         matches = self._match_frame_pool(frame_pool, max_movement)
+        print("пул создан")
 
         for det_index, detection in frame_pool.items():
             track_id = matches.get(det_index)
@@ -393,7 +393,7 @@ class main_app(App):
         self.object_tracks = {track_id: self.object_tracks[track_id] for track_id in active_track_ids}
         self.track_warning_times = {track_id: self.track_warning_times[track_id] for track_id in self.track_warning_times if track_id in active_track_ids}
         current_frame_id = self._push_frame_pool(frame_pool, obj, cords, centers, depth_dict)
-        
+        print("отделение завершено")
         #Алгоритм по отделению уже этих групп на группы близких по горизонтали и фильтрация объектов в группах
         def cluster(dist, n, List, max_dista):
             group = []
@@ -402,7 +402,7 @@ class main_app(App):
                 center_i = centers[i]
                 if ((center_n[0]-center_i[0])**2+(center_n[1]-center_i[1])**2)**0.5*dist<max_dista:
                     group.append(i)
-                    b=List.copy()
+                    b=List
                     b.remove(i)
                     if n in List:
                         b.remove(n)
@@ -425,7 +425,7 @@ class main_app(App):
                 #             group.append(k)
                 #             print(group, filter)
                 groups.append([i[0]]+[[sum(centers[k][0] for k in group)/len(group), sum(centers[k][1] for k in group)/len(group)] ]+group)
-        
+        print("близость найдена")
         #Фильтрация групп относительно фильтра важности объектов
         for i in filters:
             for j in groups.copy():
@@ -433,7 +433,7 @@ class main_app(App):
                     if obj[k]==i:
                         groups.remove(j)
                         groups.append(j)
-                
+        print("группы сформированы")
         print(groups)
         print(alert_group)
         print("_______________________________")
@@ -477,13 +477,13 @@ class main_app(App):
                     self.queue.remove(text)
                     rate=300
                     if self.say is not None and self.say.is_alive():
-                        self.say.terminate()
+                        self.say.daemon = True
                 else:
                     text = self.queue[0]
                     self.queue = self.queue[1:]
                     print(text)
                 if self.say is None or not self.say.is_alive():
-                    self.say = multiprocessing.Process(target=self.Voice_process, args=(text, rate))
+                    self.say = threading.Thread(target=self.Voice_process, args=(text, rate), daemon=True)
                     self.say.start()
             time.sleep(0.05)
 
@@ -573,10 +573,10 @@ class main_app(App):
         self.objects_stack= []
         self.Y_groups_stack = {}
         # Запасной IP ESP32 для ПК и для Android-фоллбэка, если ARP не помог.
-        self.default_esp32_ip = "192.168.137.85"
+        self.default_esp32_ip = "192.168.137.34"
         # Запасной IP и MAC ноутбука/сервера до появления фиксированного домена.
         self.default_server_ip = "127.0.0.1"
-        self.server_mac = ""
+        self.server_mac = "56-EB-3D-2D-FD-4D"
         # Активные треки объектов между кадрами и счётчик новых track_id.
         self.object_tracks = {}
         self.next_track_id = 1

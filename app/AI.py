@@ -8,7 +8,7 @@ import io
 model = YOLO("./yolov8n.pt")
 
 
-ip = "192.168.137.26"
+ip = "192.168.137.34"
 session = requests.Session()
 session.headers.update({"Connection": "keep-alive"})
 
