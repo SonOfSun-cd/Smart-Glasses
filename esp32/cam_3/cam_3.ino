@@ -135,7 +135,7 @@ void setup() {
     db_write["MAC"] = mac;
     serializeJson(db_write, db1);
     db1.close();
-    Serial.println("РџСЂРѕС€Р»Рѕ СѓСЃРїРµС€РЅРѕ");
+    Serial.println("Saved successfully");
     ESP.restart();
   }
   strcpy(mac, mac_check);
@@ -144,16 +144,16 @@ void setup() {
   
   if (String(IP_check).length()==3)
   {
-    Serial.println("Р—Р°РїСѓСЃРєР°СЋ РїСЂРѕС†РµСЃСЃ РїРѕР»СѓС‡РµРЅРёСЏ РґР°РЅРЅС‹С… С‚РѕС‡РєРё РґРѕСЃС‚СѓРїР°");
-    StartAP(); //РџРµСЂРІРѕРЅР°С‡Р°Р»СЊРЅР°СЏ РЅР°СЃС‚СЂРѕР№РєР° СЃ РїРµСЂРµРґР°С‡РµР№ Рё РїРѕР»СѓС‡РµРЅРёРµРј РґР°РЅРЅС‹С… С‚РѕС‡РєРё РґРѕСЃС‚СѓРїР°
+    Serial.println("Starting access point setup data exchange");
+    StartAP(); // Initial setup with access point data exchange
   }
   else 
   {
     snprintf(ip, sizeof(ip), "%s", data["IP"] | "");
     snprintf(ssid, sizeof(ssid), "%s", data["ssid"] | "");
     snprintf(password, sizeof(password), "%s", data["password"] | "");
-    StartConnection(ssid, password); //РќР°С‡Р°Р»Рѕ СЃРѕРµРґРёРЅРµРЅРёСЏ
-    CheckConnection(); //РџСЂРѕРІРµСЂРєР° СЃРѕРµРґРёРЅРµРЅРёСЏ
+    StartConnection(ssid, password); // Start connection
+    CheckConnection(); // Check connection
   }
   camera_setup();
   server.on("/img", handle_imgPOST);
@@ -172,7 +172,7 @@ void StartConnection(const char* SSID, const char* PASSWORD)
   {
     if (count>=20)
     {
-      Serial.println("РќРµРІРѕР·РјРѕР¶РЅРѕ СѓСЃС‚Р°РЅРѕРІРёС‚СЊ РїРѕРґРєР»СЋС‡РµРЅРёРµ. Р’РІРµРґРёС‚Рµ РґСЂСѓРіРёРµ РґР°РЅРЅС‹Рµ РёР»Рё РїРѕРїСЂРѕР±СѓР№С‚Рµ СЃРЅРѕРІР°");
+      Serial.println("Unable to connect. Enter different credentials or try again.");
       break;
     }
     delay(500);
@@ -259,7 +259,7 @@ void sendMACaddress()
   server.stop();
 
   StartConnection(ssid, password);
-  CheckConnection(); //РџСЂРѕРІРµСЂРєР° СЃРѕРµРґРёРЅРµРЅРёСЏ
+  CheckConnection(); // Check connection
 
   server.begin();
 }
