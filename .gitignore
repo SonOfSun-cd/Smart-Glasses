@@ -3,3 +3,5 @@
 *.jpg
 __pycache__/
 *.pyc
+.buildozer/*
+.buildozer/
