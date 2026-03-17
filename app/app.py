@@ -65,6 +65,18 @@ class main_app(App):
         if hasattr(self, "label") and self.label is not None:
             self.label.text = str(text)
 
+    def _purge_expired_queue(self):
+        now = time.time()
+        refreshed_queue = []
+        for item in self.queue:
+            if isinstance(item, tuple):
+                text, created_at = item
+            else:
+                text, created_at = item, now
+            if now - created_at <= self.queue_ttl_seconds:
+                refreshed_queue.append((text, created_at))
+        self.queue = refreshed_queue
+
     def _start_discovery_listener(self):
         if self.discovery_thread is not None and self.discovery_thread.is_alive():
             return
@@ -236,7 +248,7 @@ class main_app(App):
                 self._set_status(f"TTS ещё не готов, откладываю {reason}")
                 return False
 
-            speech_rate = 1.2 if rate >= 300 else 1.0
+            speech_rate = 1.8 if rate >= 300 else 1.4
             preview = text[:60] + ("..." if len(text) > 60 else "")
 
             try:
@@ -388,7 +400,47 @@ class main_app(App):
 
         return False
 
-    def _match_frame_pool(self, frame_pool, max_movement):
+    def _should_force_scene(self, scene_signature, important_count):
+        if not scene_signature:
+            self.last_frame_scene_key = None
+            self.last_frame_scene_priority = 0
+            return False
+
+        scene_priority = important_count * 3
+        for _, depth_bucket, counts in scene_signature:
+            scene_priority += sum(count for _, count in counts)
+            if depth_bucket <= 1.5:
+                scene_priority += 2
+            elif depth_bucket <= 2.5:
+                scene_priority += 1
+
+        current_positions = frozenset(position for position, _, counts in scene_signature if counts)
+        current_classes = frozenset(name for _, _, counts in scene_signature for name, count in counts if count > 0)
+        confirm_key = (current_positions, current_classes, len(scene_signature), important_count)
+        confirm_score = 0
+
+        if self.last_frame_scene_key is not None:
+            prev_positions, prev_classes, prev_group_count, prev_important_count = self.last_frame_scene_key
+            if current_positions & prev_positions:
+                confirm_score += 1
+            if current_classes & prev_classes:
+                confirm_score += 1
+            if abs(len(scene_signature) - prev_group_count) <= 1:
+                confirm_score += 1
+            if abs(important_count - prev_important_count) <= 1:
+                confirm_score += 1
+
+        confirmed = (
+            scene_priority >= self.high_scene_priority_threshold
+            and self.last_frame_scene_priority >= self.high_scene_priority_threshold
+            and confirm_score >= 2
+        )
+
+        self.last_frame_scene_key = confirm_key
+        self.last_frame_scene_priority = scene_priority
+        return confirmed
+
+    def _match_frame_pool(self, frame_pool, max_movement, current_frame_id):
         matches = {}
         used_tracks = set()
         candidates = []
@@ -396,7 +448,11 @@ class main_app(App):
         for det_index, detection in frame_pool.items():
             for track_id, track in self.object_tracks.items():
                 last_detection = track["history"][-1]
+                last_seen_frame_id = track.get("last_seen_frame_id", last_detection.get("frame_id", current_frame_id - 1))
+                frame_gap = current_frame_id - last_seen_frame_id
                 if detection["class"] != track["class"]:
+                    continue
+                if frame_gap < 1 or frame_gap > self.track_memory_frames:
                     continue
 
                 depth_now = detection["depth"]
@@ -407,9 +463,11 @@ class main_app(App):
                 if len(track["history"]) >= 2:
                     prev_center = track["history"][-2]["center"]
                     last_center = last_detection["center"]
+                    prev_frame_id = track["history"][-2].get("frame_id", last_seen_frame_id - 1)
+                    step_gap = max(last_seen_frame_id - prev_frame_id, 1)
                     predicted_center = [
-                        last_center[0] + (last_center[0] - prev_center[0]),
-                        last_center[1] + (last_center[1] - prev_center[1]),
+                        last_center[0] + (last_center[0] - prev_center[0]) * frame_gap / step_gap,
+                        last_center[1] + (last_center[1] - prev_center[1]) * frame_gap / step_gap,
                     ]
                 else:
                     predicted_center = last_detection["center"]
@@ -418,7 +476,7 @@ class main_app(App):
                 dy = detection["center"][1] - predicted_center[1]
                 distance = (dx**2 + dy**2) ** 0.5
                 track_depth = depth_now if depth_now is not None else depth_prev
-                allowed_distance = max_movement * (track_depth if track_depth is not None else 1)
+                allowed_distance = max_movement * frame_gap * (track_depth if track_depth is not None else 1)
 
                 if distance <= allowed_distance * 1.4:
                     depth_penalty = 0 if depth_now is None or depth_prev is None else abs(depth_now - depth_prev) * 50
@@ -432,44 +490,39 @@ class main_app(App):
 
         return matches
 
-    def _is_sharp_motion(self, track, detection, max_movement):
+    def _is_sharp_motion(self, track, detection, max_movement, current_frame_id):
         if len(track["history"]) < 1:
             return False
 
-        last_detection = track["history"][-1]
+        anchor_detection = None
+        frames_back = 0
+        for gap in range(self.track_memory_frames, 0, -1):
+            target_frame_id = current_frame_id - gap
+            for past_detection in reversed(track["history"]):
+                if past_detection.get("frame_id") == target_frame_id:
+                    anchor_detection = past_detection
+                    frames_back = gap
+                    break
+            if anchor_detection is not None:
+                break
+
+        if anchor_detection is None:
+            return False
+
         depth_now = detection.get("depth")
-        depth_prev = last_detection.get("depth")
+        depth_prev = anchor_detection.get("depth")
         scale = 1
         if depth_now is not None and depth_prev is not None:
             scale = max((depth_now + depth_prev) / 2, 0.3)
-        threshold = max_movement * scale
+        threshold = max_movement * frames_back * scale
 
         move_vector = [
-            detection["center"][0] - last_detection["center"][0],
-            detection["center"][1] - last_detection["center"][1],
+            detection["center"][0] - anchor_detection["center"][0],
+            detection["center"][1] - anchor_detection["center"][1],
         ]
         move_distance = (move_vector[0] ** 2 + move_vector[1] ** 2) ** 0.5
 
-        if len(track["history"]) < 2:
-            return move_distance >= threshold
-
-        prev_detection = track["history"][-2]
-        prev_vector = [
-            last_detection["center"][0] - prev_detection["center"][0],
-            last_detection["center"][1] - prev_detection["center"][1],
-        ]
-        prev_distance = (prev_vector[0] ** 2 + prev_vector[1] ** 2) ** 0.5
-
-        direction_change = 1
-        if move_distance > 0 and prev_distance > 0:
-            dot = move_vector[0] * prev_vector[0] + move_vector[1] * prev_vector[1]
-            direction_change = dot / (move_distance * prev_distance)
-
-        return move_distance >= threshold and (
-            prev_distance < threshold * 0.6
-            or direction_change < 0.4
-            or move_distance > prev_distance * 1.7
-        )
+        return move_distance >= threshold
     def load_db(self):
         with open("./db.json", "r") as f:
             return json.load(f)
@@ -477,15 +530,29 @@ class main_app(App):
     def save_db(self, data):
         with open("./db.json", "w") as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
+
+    def _persist_state(self):
+        db = self.load_db()
+        if hasattr(self, "SSID_Input") and self.SSID_Input is not None:
+            db["AP_DATA"]["SSID"] = self.SSID_Input.text
+        else:
+            db["AP_DATA"]["SSID"] = self.SSID
+        if hasattr(self, "PSWRD_Input") and self.PSWRD_Input is not None:
+            db["AP_DATA"]["PASSWORD"] = self.PSWRD_Input.text
+        else:
+            db["AP_DATA"]["PASSWORD"] = self.PSWRD
+        db["AP_DATA"]["EXCHANGED"] = bool(self.sent_AP_data)
+        db["AP_DATA"]["MAC"] = self.mac
+        db["USER_DATA"]["login"] = self.login
+        db["USER_DATA"]["password"] = self.password
+        db["USER_DATA"]["id"] = self.id
+        self.save_db(db)
     
     def AP_data_send(self):
         #"start", "cmd", "/k", 
         #os.chdir("C:/Users/user/Desktop/cam/flask_servers")
         #winwifi.WinWiFi.connect("ESP32_","pfur0651")
-        db = self.load_db()
-        db["AP_DATA"]["SSID"] = self.SSID_Input.text
-        db["AP_DATA"]["PASSWORD"] = self.PSWRD_Input.text
-        self.save_db(db)
+        self._persist_state()
 
         #result = subprocess.Popen(["py","data_exchange.py"], shell=True)
         self.label.text = "Процесс передачи начат"
@@ -512,6 +579,7 @@ class main_app(App):
             self.label.text = "Процесс передачи завершен"
             self.is_getting_AP_data = False
             self.sent_AP_data = True
+        self._persist_state()
         self.AP_send_button.background_color = self.colors["grey"]
         return
     
@@ -532,9 +600,26 @@ class main_app(App):
             "suitcase": [110, 170],
             }
         
+        object_translate = {
+            "person": "человек",
+            "handbag": "сумка",
+            "car": "машина",
+            "bird": "птица",
+            "dog": "собака",
+            "cat": "кот",
+            "umbrella": "зонт",
+            "tv": "телевизор",
+            "laptop": "ноутбук",
+            "oven": "духовка",
+            "microwave": "микроволновка",
+            "suitcase": "чемодан",
+
+        }
+
+
         max_width = 640 # Максимальная ширина изображения в пикселях
         max_dist = 500 # Максимальная дистанция группировки в пикселях
-        max_movement = 150 # Максимальный сдвиг объекта перед предупреждением о резком движении
+        max_movement = 20 # Максимальный сдвиг объекта перед предупреждением о резком движении
 
         positions = {"Слева": [0, 0.25*max_width/2], "Чуть левее": [0.25*max_width/2, 0.75*max_width/2], "Спереди": [0.75*max_width/2, 1.25*max_width/2], "Чуть правее": [1.25*max_width/2, 1.75*max_width/2], "Справа": [1.75*max_width/2, max_width]}
 
@@ -542,6 +627,7 @@ class main_app(App):
         cords = answer["cords"]
         if not obj or not cords or obj == ["no detection"]:
             return
+        current_frame_id = self.next_frame_id
         centers = [[cords[i][0]+(cords[i][2]-cords[i][0])/2, cords[i][1]+(cords[i][3]-cords[i][1])/2] for i in range(len(obj))]
         groups_depth=[]
         movement_group = []
@@ -583,7 +669,7 @@ class main_app(App):
         # Алгоритм поиска аномальных движений и их фиксации
         alert_group = []
         frame_pool = self._build_frame_pool(obj, cords, centers, depth_dict)
-        matches = self._match_frame_pool(frame_pool, max_movement)
+        matches = self._match_frame_pool(frame_pool, max_movement, current_frame_id)
         print("пул создан")
 
         for det_index, detection in frame_pool.items():
@@ -591,33 +677,38 @@ class main_app(App):
             if track_id is None:
                 track_id = self.next_track_id
                 self.next_track_id += 1
-                self.object_tracks[track_id] = {"class": detection["class"], "history": []}
+                self.object_tracks[track_id] = {"class": detection["class"], "history": [], "last_seen_frame_id": 0}
 
             detection["track_id"] = track_id
             track = self.object_tracks[track_id]
 
-            if detection["class"] == "person" and self._is_sharp_motion(track, detection, max_movement):
+            if detection["class"] == "person" and self._is_sharp_motion(track, detection, max_movement, current_frame_id):
                 alert_group.append(det_index)
                 position = ""
                 for pos in positions:
                     if centers[det_index][0] <= positions[pos][1] and centers[det_index][0] >= positions[pos][0]:
                         position = pos
                         break
-                warning_text = f"!Внимание, {position} от вас резкое движение объекта {obj[det_index]}"
+                warning_text = f"!Внимание, {position} от вас резкое движение объекта {object_translate[obj[det_index]]}"
                 now = time.time()
                 last_warning_time = self.track_warning_times.get(track_id, 0)
-                if now - last_warning_time >= self.warning_cooldown_seconds and warning_text not in self.queue:
+                self._purge_expired_queue()
+                if now - last_warning_time >= self.warning_cooldown_seconds and not any((item[0] if isinstance(item, tuple) else item) == warning_text for item in self.queue):
                     if len(self.queue) >= self.max_queue_len:
                         self.queue = self.queue[1:]
-                    self.queue.append(warning_text)
+                    self.queue.append((warning_text, now))
                     self.track_warning_times[track_id] = now
 
-            track["history"].append({"center": detection["center"], "depth": detection["depth"], "index": det_index})
-            track["history"] = track["history"][-3:]
+            track["last_seen_frame_id"] = current_frame_id
+            track["history"].append({"center": detection["center"], "depth": detection["depth"], "index": det_index, "frame_id": current_frame_id})
+            track["history"] = track["history"][-self.track_memory_frames:]
 
-        active_track_ids = {frame_pool[i]["track_id"] for i in frame_pool}
-        self.object_tracks = {track_id: self.object_tracks[track_id] for track_id in active_track_ids}
-        self.track_warning_times = {track_id: self.track_warning_times[track_id] for track_id in self.track_warning_times if track_id in active_track_ids}
+        self.object_tracks = {
+            track_id: track
+            for track_id, track in self.object_tracks.items()
+            if current_frame_id - track.get("last_seen_frame_id", 0) <= self.track_memory_frames
+        }
+        self.track_warning_times = {track_id: self.track_warning_times[track_id] for track_id in self.track_warning_times if track_id in self.object_tracks}
         current_frame_id = self._push_frame_pool(frame_pool, obj, cords, centers, depth_dict)
         print("отделение завершено")
         # Алгоритм отделения этих групп на горизонтально близкие группы и их фильтрация
@@ -680,13 +771,23 @@ class main_app(App):
                     position = pos
                     break
             objects_in_group = [obj[j] for j in i[2:]]
-            local_text += position + " на расстоянии " + f"{i[0]:.2f}" + " метров от вас находится группа из " + ', '.join([str(objects_in_group.count(j)) + " " + j for j in filters if objects_in_group.count(j) != 0])
+            local_text += position + " на расстоянии " + f"{i[0]:.2f}" + " метров от вас находится группа из " + ', '.join([str(objects_in_group.count(j)) + " " + object_translate.get(j, j) for j in filters if objects_in_group.count(j) != 0])
             text+=f"{local_text}; \n"
+        if text and self._should_force_scene(scene_signature, important_count):
+            self.queue = []
+            self.pending_tts = None
+            self._set_status("Подтверждён информативный кадр, озвучиваю сразу")
+            self._stop_voice_output("priority_scene")
+            self._speak_text(text, 260, "priority_scene")
+            self.last_scene_signature = scene_signature
+            self.last_important_count = important_count
+            return
         if self._should_enqueue_scene(scene_signature, important_count):
-            if text not in self.queue:
+            self._purge_expired_queue()
+            if not any((item[0] if isinstance(item, tuple) else item) == text for item in self.queue):
                 if len(self.queue) >= self.max_queue_len:
                     self.queue = self.queue[1:]
-                self.queue.append(text)
+                self.queue.append((text, time.time()))
         print(text)
         print(self.queue)
 
@@ -699,17 +800,20 @@ class main_app(App):
                 self.pending_tts = None
                 self._speak_text(text, rate, reason)
 
+            self._purge_expired_queue()
             if self.queue:
-                dangers = [text for text in self.queue if "!" in text]
+                dangers = [item for item in self.queue if "!" in (item[0] if isinstance(item, tuple) else item)]
                 if dangers:
-                    text = dangers[-1]
-                    self.queue.remove(text)
+                    item = dangers[-1]
+                    self.queue.remove(item)
+                    text = item[0] if isinstance(item, tuple) else item
                     self._set_status("Очередь озвучки: беру warning")
                     if self._voice_is_busy():
                         self._stop_voice_output("warning")
                     self._speak_text(text, 300, "warning")
                 elif not self._voice_is_busy():
-                    text = self.queue.pop()
+                    item = self.queue.pop()
+                    text = item[0] if isinstance(item, tuple) else item
                     self._set_status("Очередь озвучки: беру описание сцены")
                     self._speak_text(text, 230, "scene")
             time.sleep(0.05)
@@ -735,6 +839,7 @@ class main_app(App):
 
         login = self.login
         password = hashlib.sha256(self.password.encode()).hexdigest()
+        retry_announced = False
         try:
             self._set_status(f"Подключаюсь к серверу по IP {server_ip}")
             session_start = requests.get(f"{server_url}/start/{login}/{password}")
@@ -742,11 +847,16 @@ class main_app(App):
 
             print(session_start.json())
             self.id = session_start.json()["id"]
+            self._persist_state()
         except HTTPError as error:
-            self.label.text = f"Ошибка при установлении соединения: {error.response.text}"
+            error_text = f"Ошибка при установлении соединения: {error.response.text}"
+            self.label.text = error_text
+            Clock.schedule_once(lambda dt, text=error_text: self._speak_text(text, 260, "error"), 0)
             return
         except RequestException as error:
-            self.label.text = f"Не получилось подключиться к серверу {server_ip}: {error}"
+            error_text = f"Не получилось подключиться к серверу {server_ip}: {error}"
+            self.label.text = error_text
+            Clock.schedule_once(lambda dt, text=error_text: self._speak_text(text, 260, "error"), 0)
             return
         if self.voice_thread is None or not self.voice_thread.is_alive():
             self.voice_thread = threading.Thread(target=self.Voice_text, daemon=True)
@@ -755,6 +865,7 @@ class main_app(App):
             try:
                 img = session.get(f"http://{IP}:3000/img")
                 if img.status_code == 200:
+                    retry_announced = False
                     files = {"img": img.content}
                     try:
                         answer = session.post(f"{server_url}/session/{self.id}", files=files)
@@ -763,13 +874,15 @@ class main_app(App):
                         if answer.json()["answer"]!="...":
                             self.AI_analyse(answer.json()["answer"])
                     except HTTPError as error:
-                        self.label.text = f"Ошибка при отправке изображения: {error.response.text}"
+                        error_text = f"Ошибка при отправке изображения: {error.response.text}"
+                        self.label.text = error_text
+                        Clock.schedule_once(lambda dt, text=error_text: self._speak_text(text, 260, "error"), 0)
                         return
                     i+=1
-            except:
-                self.label.text = "Не получается установить соединение. Повторяю попытку..."
+            except Exception as error:
+                error_text = f"Не получается установить соединение. Повторяю попытку. {error}"
+                self.label.text = error_text
                 IP = self._resolve_esp32_ip(self.mac, self.default_esp32_ip, "ESP32")
-                time.sleep(1)
                 continue
             # files = {"img": open(f"./images/img_{i}.jpg", "rb")}
             # answer = requests.post(f"http://127.0.0.1:8000/session/{self.id}", files=files)
@@ -787,6 +900,8 @@ class main_app(App):
         self.current_frame_id = None
         self.last_scene_signature = None
         self.last_important_count = 0
+        self.last_frame_scene_key = None
+        self.last_frame_scene_priority = 0
         self.track_warning_times = {}
         return
     
@@ -816,17 +931,19 @@ class main_app(App):
         self.discovery_thread = None
         self.discovery_running = False
         self.discovery_socket = None
-        # Активные треки объектов между кадрами и счётчик новых track_id.
+        # Активные треки объектов, счётчик новых track_id и глубина памяти по кадрам.
         self.object_tracks = {}
         self.next_track_id = 1
+        self.track_memory_frames = 5
         # Сырые frame_pool последних кадров и счётчик новых frame_id.
         self.frame_history = {}
         self.max_frame_history = 50
         self.next_frame_id = 1
         self.current_frame_id = None
-        # Очередь озвучки и её максимальный размер.
+        # Очередь озвучки, её максимальный размер и время жизни одного текста.
         self.queue = []
         self.max_queue_len = 6
+        self.queue_ttl_seconds = 5
         # Backend озвучки: Android TTS в проде и консольная симуляция на ПК.
         self.voice_thread = None
         self.voice_backend = None
@@ -848,6 +965,10 @@ class main_app(App):
         # Последняя озвученная сигнатура сцены для отсечения одинаковых описаний.
         self.last_scene_signature = None
         self.last_important_count = 0
+        # Последний кадр-кандидат на экстренную озвучку и его приоритет.
+        self.last_frame_scene_key = None
+        self.last_frame_scene_priority = 0
+        self.high_scene_priority_threshold = 9
         # Время последних варнингов по track_id, чтобы не спамить одним объектом.
         self.track_warning_times = {}
         self.warning_cooldown_seconds = 2.5
@@ -991,15 +1112,12 @@ class main_app(App):
             except Exception:
                 pass
 
-        db = self.load_db()
-        db["AP_DATA"]["SSID"] = self.SSID_Input.text
-        db["AP_DATA"]["PASSWORD"] = self.PSWRD_Input.text
-        db["AP_DATA"]["EXCHANGED"] = bool(self.sent_AP_data)
-        db["AP_DATA"]["MAC"] = self.mac
-        db["USER_DATA"]["login"] = self.login
-        db["USER_DATA"]["password"] = self.password
-        self.save_db(db)
+        self._persist_state()
         print("Commiting all changes")
+
+    def on_pause(self):
+        self._persist_state()
+        return True
 
     # Функции для кнопок
 
@@ -1015,6 +1133,7 @@ class main_app(App):
     def Server_start_func(self, instance):
         if self.sent_AP_data and not self.started_server:
             self.label.text=self.labels["start"]
+            Clock.schedule_once(lambda dt: self._speak_text("Начинаю установку соединения с очками", 240, "system"), 0)
             self.Server_start_button.background_color = self.colors["green"]
             self.started_server=True
             f = threading.Thread(target=self.Server_start)
@@ -1027,9 +1146,11 @@ class main_app(App):
             self.queue = []
             self.pending_tts = None
             self._stop_voice_output("manual_stop")
+            Clock.schedule_once(lambda dt: self._speak_text("Соединение отключено", 240, "system"), 0)
             self.Server_start_button.background_color = self.colors["grey"]
         else:
             self.label.text=self.labels["deny"]
+            Clock.schedule_once(lambda dt, text=self.labels["deny"]: self._speak_text(text, 240, "system"), 0)
 
     def Terminate_func(self, instance):
         x = threading.Thread(target=self.terminate_url)
@@ -1044,6 +1165,7 @@ class main_app(App):
     def submit_register(self, instance):
         self.login = self.login_input.text
         self.password = self.password_input.text
+        self._persist_state()
 
         login = self.login
         password = hashlib.sha256(self.password.encode()).hexdigest()
@@ -1067,6 +1189,7 @@ class main_app(App):
         self.main_layout.clear_widgets()
         self.main_layout.add_widget(self.layout)
         self.label.text = status_text
+        self._persist_state()
 
     def cancel_register(self, instance):
         self.main_layout.clear_widgets()

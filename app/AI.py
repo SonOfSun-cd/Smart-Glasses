@@ -8,7 +8,7 @@ import io
 model = YOLO("./yolov8n.pt")
 
 
-ip = "192.168.137.34"
+ip = "10.243.140.15"
 session = requests.Session()
 session.headers.update({"Connection": "keep-alive"})
 
@@ -20,7 +20,7 @@ for i in range(1000000):
         print("Not able to establish connection. Retrying...")
         continue
     
-    img = Image.open(io.BytesIO(img)).transpose(Image.Transpose.ROTATE_270)
+    img = Image.open(io.BytesIO(img)).transpose(Image.Transpose.ROTATE_90)
     print(i)
 
     frame = model.predict(img)
