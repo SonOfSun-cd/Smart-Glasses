@@ -31,7 +31,7 @@ def AI_analyse(id, image):
     global count
     #global queue, model
     print("Got image")
-    img = Image.open(io.BytesIO(image))
+    img = Image.open(io.BytesIO(image)).transpose(Image.Transpose.ROTATE_270)
     # img.save(f"images/image_{count}.png")
     count+=1
     frame = model.predict(img, conf=0.5)

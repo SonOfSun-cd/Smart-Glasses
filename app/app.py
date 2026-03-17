@@ -124,17 +124,38 @@ class main_app(App):
 
     def _create_android_tts(self, dt):
         try:
-            self.android_tts_class = autoclass("android.speech.tts.TextToSpeech")
+            from jnius import PythonJavaClass, autoclass, java_method
+
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
             Locale = autoclass("java.util.Locale")
+            Bundle = autoclass("android.os.Bundle")
+            HashMap = autoclass("java.util.HashMap")
+            JavaString = autoclass("java.lang.String")
+            TextToSpeech = autoclass("android.speech.tts.TextToSpeech")
 
-            self.tts_locale = Locale("ru", "RU")
-            self.tts_listener = None
-            self.tts_engine = self.android_tts_class(PythonActivity.mActivity, None)
+            app = self
+
+            class TTSInitListener(PythonJavaClass):
+                __javainterfaces__ = ["android/speech/tts/TextToSpeech$OnInitListener"]
+                __javacontext__ = "app"
+
+                def __init__(self):
+                    super().__init__()
+
+                @java_method("(I)V")
+                def onInit(self, status):
+                    Clock.schedule_once(lambda dt: app._on_android_tts_init(status), 0)
+
+            self.android_tts_class = TextToSpeech
+            self.tts_locale = Locale.getDefault()
+            self.tts_bundle_class = Bundle
+            self.tts_hashmap_class = HashMap
+            self.tts_java_string_class = JavaString
+            self.tts_listener = TTSInitListener()
+            self.tts_engine = self.android_tts_class(PythonActivity.mActivity, self.tts_listener)
             self.voice_backend = "android_tts"
             self.voice_backend_ready = True
             self.voice_backend_initializing = False
-            self.voice_init_started_at = time.time()
             self._set_status("Инициализирую Android TTS...")
         except Exception as error:
             self.voice_backend = "console"
@@ -143,32 +164,36 @@ class main_app(App):
             self.voice_init_event.set()
             self._set_status(f"TTS fallback в консоль: {error}")
 
-    def _ensure_android_tts_ready(self):
-        if self.voice_backend != "android_tts" or self.tts_engine is None:
-            return False
+    def _on_android_tts_init(self, status):
+        if self.tts_engine is None or self.android_tts_class is None:
+            self._set_status("Android TTS не создался")
+            return
 
-        if self.tts_ready:
-            return True
-
-        if time.time() - self.voice_init_started_at < self.voice_warmup_seconds:
-            return False
+        if status != self.android_tts_class.SUCCESS:
+            self._set_status(f"Ошибка инициализации Android TTS: {status}")
+            return
 
         try:
             if self.tts_locale is not None:
                 language_status = self.tts_engine.setLanguage(self.tts_locale)
                 if language_status == self.android_tts_class.LANG_MISSING_DATA:
-                    self._set_status("В Android TTS отсутствуют данные русского языка")
-                    return False
+                    self._set_status("В Android TTS отсутствуют данные системного языка")
+                    return
                 if language_status == self.android_tts_class.LANG_NOT_SUPPORTED:
-                    self._set_status("Android TTS не поддерживает русский язык")
-                    return False
+                    self._set_status("Android TTS не поддерживает системный язык")
+                    return
+
             self.tts_ready = True
             self.voice_init_event.set()
             self._set_status("Android TTS готов")
-            return True
         except Exception as error:
             self._set_status(f"Ошибка подготовки Android TTS: {error}")
+
+    def _ensure_android_tts_ready(self):
+        if self.voice_backend != "android_tts" or self.tts_engine is None:
             return False
+
+        return self.tts_ready
 
     def _init_voice_backend(self):
         if self.voice_backend_ready:
@@ -217,10 +242,26 @@ class main_app(App):
             try:
                 self.tts_engine.setSpeechRate(speech_rate)
                 utterance_id = str(int(time.time() * 1000))
+                java_text = self.tts_java_string_class(text)
+                result = None
                 try:
-                    self.tts_engine.speak(text, self.android_tts_class.QUEUE_FLUSH, None, utterance_id)
+                    params = self.tts_bundle_class()
+                    result = self.tts_engine.speak(
+                        java_text,
+                        self.android_tts_class.QUEUE_FLUSH,
+                        params,
+                        utterance_id,
+                    )
                 except TypeError:
-                    self.tts_engine.speak(text, self.android_tts_class.QUEUE_FLUSH, None)
+                    params = self.tts_hashmap_class()
+                    result = self.tts_engine.speak(
+                        java_text,
+                        self.android_tts_class.QUEUE_FLUSH,
+                        params,
+                    )
+                if result == self.android_tts_class.ERROR:
+                    self._set_status("Android TTS вернул ошибку при озвучке")
+                    return False
                 self._set_status(f"Озвучиваю {reason}: {preview}")
                 return True
             except Exception as error:
@@ -477,22 +518,21 @@ class main_app(App):
     def AI_analyse(self, answer):
         filters = ["car", "person", "dog", "cat", "bird", "handbag", "suitcase", "umbrella", "tv", "laptop", "microwave", "oven"]
         distance_filter = {
-            "person": [300, 700], 
-            "handbag": [80, 170], 
-            "car": [500, 700], 
-            "bird": [50,50], 
-            "dog": [150, 250], 
-            "cat": [150, 250], 
-            "umbrella": [150, 250],
-            "tv": [150, 250], 
-            "laptop": [150, 250],
-            "oven": [150, 250],
-            "tv": [150, 250],
-            "microwave": [150, 250],
-            "suitcase": [150, 250],
+            "person": [220, 520],
+            "handbag": [70, 110],
+            "car": [420, 180],
+            "bird": [45, 35],
+            "dog": [160, 120],
+            "cat": [120, 90],
+            "umbrella": [110, 180],
+            "tv": [180, 110],
+            "laptop": [95, 65],
+            "oven": [150, 150],
+            "microwave": [110, 70],
+            "suitcase": [110, 170],
             }
         
-        max_width = 1920 # Максимальная ширина изображения в пикселях
+        max_width = 640 # Максимальная ширина изображения в пикселях
         max_dist = 500 # Максимальная дистанция группировки в пикселях
         max_movement = 150 # Максимальный сдвиг объекта перед предупреждением о резком движении
 
@@ -500,6 +540,8 @@ class main_app(App):
 
         obj = answer["objects"]
         cords = answer["cords"]
+        if not obj or not cords or obj == ["no detection"]:
+            return
         centers = [[cords[i][0]+(cords[i][2]-cords[i][0])/2, cords[i][1]+(cords[i][3]-cords[i][1])/2] for i in range(len(obj))]
         groups_depth=[]
         movement_group = []
@@ -638,7 +680,7 @@ class main_app(App):
                     position = pos
                     break
             objects_in_group = [obj[j] for j in i[2:]]
-            local_text += position + " на расстоянии " + str(i[0]) + " метров от вас находится группа из " + ', '.join([str(objects_in_group.count(j)) + " " + j for j in filters if objects_in_group.count(j) != 0])
+            local_text += position + " на расстоянии " + f"{i[0]:.2f}" + " метров от вас находится группа из " + ', '.join([str(objects_in_group.count(j)) + " " + j for j in filters if objects_in_group.count(j) != 0])
             text+=f"{local_text}; \n"
         if self._should_enqueue_scene(scene_signature, important_count):
             if text not in self.queue:
@@ -667,8 +709,7 @@ class main_app(App):
                         self._stop_voice_output("warning")
                     self._speak_text(text, 300, "warning")
                 elif not self._voice_is_busy():
-                    text = self.queue[-1]
-                    self.queue = self.queue[1:]
+                    text = self.queue.pop()
                     self._set_status("Очередь озвучки: беру описание сцены")
                     self._speak_text(text, 230, "scene")
             time.sleep(0.05)
@@ -785,7 +826,7 @@ class main_app(App):
         self.current_frame_id = None
         # Очередь озвучки и её максимальный размер.
         self.queue = []
-        self.max_queue_len = 15
+        self.max_queue_len = 6
         # Backend озвучки: Android TTS в проде и консольная симуляция на ПК.
         self.voice_thread = None
         self.voice_backend = None
@@ -798,6 +839,9 @@ class main_app(App):
         self.tts_listener = None
         self.tts_ready = False
         self.tts_locale = None
+        self.tts_bundle_class = None
+        self.tts_hashmap_class = None
+        self.tts_java_string_class = None
         self.android_tts_class = None
         self.pending_tts = None
         self.console_voice_busy_until = 0
@@ -980,6 +1024,9 @@ class main_app(App):
         elif self.started_server:
             self.label.text=self.labels["stop"]
             self.started_server=False
+            self.queue = []
+            self.pending_tts = None
+            self._stop_voice_output("manual_stop")
             self.Server_start_button.background_color = self.colors["grey"]
         else:
             self.label.text=self.labels["deny"]
@@ -1000,20 +1047,26 @@ class main_app(App):
 
         login = self.login
         password = hashlib.sha256(self.password.encode()).hexdigest()
+        status_text = "..."
+        server_ip = self.default_server_ip
+        if hasattr(self, "Server_IP_Input") and self.Server_IP_Input is not None:
+            debug_server_ip = self.Server_IP_Input.text.strip()
+            if debug_server_ip:
+                self.default_server_ip = debug_server_ip
+                server_ip = debug_server_ip
 
 
         try:
-            id_req = requests.get(f"http://127.0.0.1:8000/register/{login}/{password}")
+            id_req = requests.get(f"http://{server_ip}:8000/register/{login}/{password}")
             if id_req.status_code==200:
-                id = id_req.json()["id"]
-                self.id = id
-                print(id)
-        except:
-            print("Something went wrong, please try again later")
+                status_text = "Регистрация завершена"
+        except Exception as error:
+            status_text = f"Ошибка регистрации: {error}"
         self.create_main_layout()
 
         self.main_layout.clear_widgets()
         self.main_layout.add_widget(self.layout)
+        self.label.text = status_text
 
     def cancel_register(self, instance):
         self.main_layout.clear_widgets()

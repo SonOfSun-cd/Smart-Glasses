@@ -20,7 +20,7 @@ for i in range(1000000):
         print("Not able to establish connection. Retrying...")
         continue
     
-    img = Image.open(io.BytesIO(img))
+    img = Image.open(io.BytesIO(img)).transpose(Image.Transpose.ROTATE_270)
     print(i)
 
     frame = model.predict(img)

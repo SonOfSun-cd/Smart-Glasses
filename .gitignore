@@ -2,6 +2,10 @@
 *.jpeg
 *.jpg
 __pycache__/
+__pycache__/*
 *.pyc
 .buildozer/*
 .buildozer/
+*.cpython-*-*.egg-info/
+*.log
+*.cpython-*.pyc
