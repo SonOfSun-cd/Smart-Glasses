@@ -29,26 +29,42 @@ for i in range(30):
 
 def AI_analyse(id, image):
     global count
-    #global queue, model
+    # global queue, model
     print("Got image")
+    
+    # Список классов, которые нужно игнорировать
+    IGNORE_CLASSES = {"tv", "suitcase", "umbrella", "microwave", "oven"}
+
     img = Image.open(io.BytesIO(image)).transpose(Image.Transpose.ROTATE_90)
     # img.save(f"images/image_{count}.png")
-    count+=1
-    frame = model.predict(img, conf=0.5)
+    count += 1
+    
+    frame = model.predict(img, conf=0.6)
     objects = []
     cords = []
     result = frame[0]
+    
     if result.boxes is not None:
-        # Получите классы, confidence и координаты
         classes = result.boxes.cls  # Классы (номера)
+        boxes = result.boxes.xyxy   # Координаты
         class_names = result.names  # Словарь с именами классов
-        # Сформируйте список объектов
+        
+        # Проходим по всем найденным объектам ОДИН раз
         for idx, cls in enumerate(classes):
             object_name = class_names[int(cls)]
+            
+            # Если объект в списке игнорируемых, пропускаем его
+            if object_name in IGNORE_CLASSES:
+                continue
+            
+            # Если объект НЕ игнорируется, добавляем имя
             objects.append(object_name)
-        for idx, box in enumerate(result.boxes.xyxy):
+            
+            # И добавляем соответствующие координаты (по тому же индексу idx)
+            box = boxes[idx]
             x1, y1, x2, y2 = box.tolist()
-            cords.append([round(x1,2), round(y1,2), round(x2,2), round(y2,2)])
+            cords.append([round(x1, 2), round(y1, 2), round(x2, 2), round(y2, 2)])
+    
     queue.update({id: {"objects": objects, "cords": cords}})
     return
 
